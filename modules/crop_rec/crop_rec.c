@@ -3203,7 +3203,9 @@ if (CROP_PRESET_MENU == CROP_PRESET_1x3 || CROP_PRESET_MENU == CROP_PRESET_anamo
     }
     
     /* We don´t want this when in photo mode I assume */
-    if (!is_movie_mode() || CROP_PRESET_MENU == CROP_PRESET_OFF) return 0;
+    /* preset OFF: keep going while our hooks are still installed, so LiveView gets refreshed
+     * (see crop_rec_needs_lv_refresh) and the sensor goes back to Canon's mode */
+    if (!is_movie_mode() || (CROP_PRESET_MENU == CROP_PRESET_OFF && !patch_active)) return 0;
     
     /* also check at startup */
     static int lv_dirty = 1;

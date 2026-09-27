@@ -29,6 +29,10 @@ static struct menu_entry movie_menu_raw_toggle[] =
     //     .placeholder = 1,
     // },
     {
+        .name = "Cine presets",     /* mlv_lite, 5D3: one-click FF HQ / S35 HQ / FF SAFE */
+        .placeholder = 1,
+    },
+    {
         .name = "Presets",
         .placeholder = 1,
     },

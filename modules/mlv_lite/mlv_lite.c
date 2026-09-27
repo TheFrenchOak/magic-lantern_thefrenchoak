@@ -197,6 +197,13 @@ static CONFIG_INT("raw.naming", file_naming, 0);
 static CONFIG_INT("raw.naming.cam", cam_letter, 0);     /* 0 = A ... 25 = Z */
 static CONFIG_INT("raw.naming.reel", reel_number, 1);
 static CONFIG_INT("raw.naming.clip", clip_number, 1);   /* next clip */
+
+/* Cine presets (5D3), see cine_preset_apply */
+static CONFIG_INT("raw.cine.preset", cine_preset, 0);           /* last applied, 0 = none */
+static CONFIG_INT("raw.cine.crop_idx", cine_crop_index, -1);    /* crop_rec preset index it selected */
+static CONFIG_INT("raw.cine.spanning", cine_spanning, 0);       /* card spanning it selected */
+static CONFIG_INT("raw.cine.bitdepth", cine_bitdepth, 0);       /* crop_rec bit depth it selected */
+static void cine_preset_update_state();
 static CONFIG_INT("raw.CropRecPreview", prevmode, 1);
 #define PREVMODE_AUTO_GRAY_REC  1   /* auto preview; gray ultra-fast preview while recording (fastest) */
 #define PREVMODE_AUTO_COLOR_REC 2   /* auto preview; color preview while recording, unless the buffer fills up */
@@ -2081,6 +2088,13 @@ static REQUIRES(ShootTask) EXCLUDES(settings_sem)
 unsigned int raw_rec_polling_cbr(unsigned int unused)
 {
     if (!compress_mq) return 0;
+
+    /* Cine presets: have the settings changed since the preset was applied? */
+    static int cine_aux = INT_MIN;
+    if (cam_5d3 && cine_preset && should_run_polling_action(1000, &cine_aux))
+    {
+        cine_preset_update_state();
+    }
 
     raw_lv_request_update();
 
@@ -4815,6 +4829,449 @@ unsigned int raw_rec_update_preview(unsigned int ctx)
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Cine presets (5D3)
+ * One click sets everything for three ready-to-shoot setups: sensor mode and
+ * bit depth (crop_rec), format, cards and preview (here), sound (mlv_snd),
+ * Dual ISO off, SD overclock (sd_uhs, enabled if needed).
+ * Settings owned by other modules are changed through their menus.
+ * Canon's movie mode (1920x1080 24p) and the movie switch can't be set from
+ * here safely, so they are only checked.
+ * ------------------------------------------------------------------------- */
+
+#define CINE_PRESET_NONE    0
+#define CINE_PRESET_FF_HQ   1
+#define CINE_PRESET_S35_HQ  2
+#define CINE_PRESET_FF_SAFE 3
+
+#define CROP_REC_BITDEPTH_OFF   0   /* 14-bit */
+#define CROP_REC_BITDEPTH_10    3
+#define CROP_REC_BITDEPTH_12    4
+
+struct cine_preset_def
+{
+    const char * name;
+    const char * crop_rec;      /* crop_rec preset, as named in its menu */
+    int bitdepth_span;          /* crop_rec bit depth with card spanning (CF + SD) */
+    int bitdepth_cf;            /* crop_rec bit depth with the CF card only */
+    const char * no_sd_note;    /* shown when the preset wants card spanning, but there's no SD card */
+    int spanning;               /* use card spanning when an SD card is present */
+    int resolution;             /* index in resolution_presets_x */
+    int aspect;                 /* index in aspect_ratio_presets_num/den */
+    int crop_rec_preview;       /* prevmode */
+    int preview;                /* preview_mode, used when crop_rec_preview is OFF */
+    int zoom;                   /* LiveView zoom needed by the crop_rec preset */
+};
+
+/* data rates at 23.976 fps, lossless (estimated):
+ * 5.7K 1x3 1920x2340: 14-bit 104-123 MB/s, 10-bit 74-88 MB/s
+ * 3.5K 1:1 3584x1730: 12-bit 119-145 MB/s, 10-bit 99-121 MB/s
+ * 3x3 1920x1280:      14-bit 57-68 MB/s
+ * CF alone: ~90 MB/s; card spanning with SD overclock: ~135-145 MB/s */
+static const struct cine_preset_def cine_presets[] = {
+    [CINE_PRESET_FF_HQ] = {
+        .name               = "FF HQ",
+        .crop_rec           = "anamorphic",             /* 5.7K 1x3, full sensor width */
+        .bitdepth_span      = CROP_REC_BITDEPTH_OFF,
+        .bitdepth_cf        = CROP_REC_BITDEPTH_10,
+        .no_sd_note         = "No SD card: 10-bit on CF only.",
+        .spanning           = 1,
+        .resolution         = 11,                       /* max width */
+        .aspect             = 17,                       /* 1:2 = max height */
+        .crop_rec_preview   = PREVMODE_AUTO_GRAY_REC,
+        .preview            = 2,
+        .zoom               = 1,
+    },
+    [CINE_PRESET_S35_HQ] = {
+        .name               = "S35 HQ",
+        .crop_rec           = "3.5K 1:1 centered x5",   /* 3.5K 1:1, ~1.6x crop */
+        .bitdepth_span      = CROP_REC_BITDEPTH_10,
+        .bitdepth_cf        = CROP_REC_BITDEPTH_10,
+        .no_sd_note         = "No SD card: CF only, recording may not be continuous.",
+        .spanning           = 1,
+        .resolution         = 11,
+        .aspect             = 17,
+        .crop_rec_preview   = PREVMODE_AUTO_GRAY_REC,
+        .preview            = 2,
+        .zoom               = 5,
+    },
+    [CINE_PRESET_FF_SAFE] = {
+        .name               = "FF SAFE",
+        .crop_rec           = "OFF",                    /* Canon 1080p, 3x3 binning */
+        .bitdepth_span      = CROP_REC_BITDEPTH_OFF,
+        .bitdepth_cf        = CROP_REC_BITDEPTH_OFF,
+        .no_sd_note         = "",
+        .spanning           = 0,
+        .resolution         = 4,                        /* 1920 */
+        .aspect             = 12,                       /* 3:2 -> 1920x1280 */
+        .crop_rec_preview   = 0,
+        .preview            = 1,                        /* Real-time: color, HDMI */
+        .zoom               = 1,
+    },
+};
+
+static int cine_preset_valid(int id)
+{
+    return id > CINE_PRESET_NONE && id < COUNT(cine_presets);
+}
+
+/* are all the settings still the ones from the last preset? (updated by cine_preset_update_state) */
+static int cine_preset_ok = 0;
+
+static int cine_preset_unchanged()
+{
+    return cine_preset_valid(cine_preset) && cine_preset_ok;
+}
+
+static void cine_preset_update_state()
+{
+    cine_preset_ok = 0;
+
+    if (!cine_preset_valid(cine_preset)) return;
+    const struct cine_preset_def * p = &cine_presets[cine_preset];
+
+    /* mlv_lite */
+    if (!raw_video_enabled || output_format != OUTPUT_14BIT_LOSSLESS) return;
+    if (resolution_index_x != p->resolution || res_x_fine != 0 || aspect_ratio_index != p->aspect) return;
+    if (card_spanning != cine_spanning) return;
+    if (pref_card != ((!cine_spanning && cam_dualcard) ? 1 : 0)) return;    /* CF, as set by cine_preset_apply */
+    if (prevmode != p->crop_rec_preview) return;
+    if (!prevmode && preview_mode != p->preview) return;
+    if (pre_record || rec_trigger || h264_proxy_menu || kill_gd || dolly_mode) return;
+
+    /* crop_rec: active sensor mode, and the other settings as selected in its menu */
+    if (crop_preset_index != cine_crop_index || bitdepth != cine_bitdepth) return;
+    if (menu_get_value_from_script("Presets", "set 25fps") != 0) return;
+    if (menu_get_value_from_script("Presets", "x3crop") != 0) return;
+    if (menu_get_value_from_script("Movie", "Ratio") != 0) return;
+
+    /* sound (mlv_snd), no Dual ISO */
+    if (menu_get_value_from_script("Sound recording", "Enable sound") != 1) return;
+    if (menu_get_value_from_script("Sound recording", "Sampling rate") != 0) return;
+    if (menu_get_value_from_script("Expo", "Dual ISO") > 0) return;
+
+    /* Canon: movie mode, 1920x1080 24p */
+    if (!is_movie_mode() || video_mode_resolution != 0 || video_mode_fps != 24) return;
+
+    /* frame rate: no FPS override, and the sensor really runs at 23.976
+     * (23.976-23.977 with the timers of all three presets) */
+    if (menu_get_value_from_script("Movie", "FPS override") > 0) return;
+    if (lv && ABS(fps_get_current_x1000() - 23976) > 2) return;
+
+    cine_preset_ok = 1;
+}
+
+static int module_is_enabled(const char * name)
+{
+    for (int m = module_get_next_loaded(-1); m >= 0; m = module_get_next_loaded(m))
+    {
+        if (streq(module_get_name(m), name))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* SD overclock (sd_uhs) for card spanning; returns 1 if the camera must be restarted */
+static int cine_preset_setup_sd_overclock()
+{
+    if (!module_is_enabled("sd_uhs"))
+    {
+        /* enable the module for the next boot, with the 192 MHz preset
+         * (unless it already has a config file, which we keep) */
+        char path[FIO_MAX_PATH_LENGTH];
+        snprintf(path, sizeof(path), "%ssd_uhs.en", get_config_dir());
+        config_flag_file_setting_save(path, 1);
+
+        /* module configs only store non-default values, and OFF is the default:
+         * without an "sd.sd_overclock = 1...3" line, the module would start with overclock OFF */
+        snprintf(path, sizeof(path), "%ssd_uhs.cfg", get_config_dir());
+        int size = 0;
+        char * old_cfg = (char *) read_entire_file(path, &size);
+        char * oc = old_cfg ? strstr(old_cfg, "sd.sd_overclock = ") : 0;
+        int overclock_saved = oc && oc[18] >= '1' && oc[18] <= '3';
+        int sdr50 = old_cfg && strstr(old_cfg, "sd.sd_access_mode = 0");
+        if (old_cfg) fio_free(old_cfg);
+
+        if (!overclock_saved)
+        {
+            /* 192 MHz; keep the access mode if the user picked SDR50 */
+            FILE * f = FIO_CreateFile(path);
+            if (f)
+            {
+                char cfg[128];
+                snprintf(cfg, sizeof(cfg), "# Config file for module sd_uhs\n\nsd.sd_overclock = 2\r\n%s",
+                    sdr50 ? "sd.sd_access_mode = 0\r\n" : "");
+                FIO_WriteFile(f, cfg, strlen(cfg));
+                FIO_CloseFile(f);
+            }
+        }
+        return 1;
+    }
+
+    /* 160/192/240 MHz: keep the user's choice; OFF: use 192 MHz */
+    if (menu_get_value_from_script("Movie", "SD Overclock") == 0)
+    {
+        menu_set_value_from_script("Movie", "SD Overclock", 2);
+        return 1;   /* sd_uhs only overclocks at startup */
+    }
+
+    return 0;
+}
+
+static volatile int cine_preset_busy = 0;
+
+/* is the sensor in the mode this preset needs? (from the raw geometry reported by the raw backend) */
+static int cine_preset_sensor_ok(int id)
+{
+    if (!raw_video_enabled || !RAW_IS_IDLE) return 0;
+
+    int w = raw_info.active_area.x2 - raw_info.active_area.x1;
+    int h = raw_info.active_area.y2 - raw_info.active_area.y1;
+    int bx = raw_capture_info.binning_x + raw_capture_info.skipping_x;
+    int by = raw_capture_info.binning_y + raw_capture_info.skipping_y;
+
+    switch (id)
+    {
+        case CINE_PRESET_FF_HQ:     /* 1x3: all lines, 3 columns binned */
+            return lv_dispsize == 1 && bx == 3 && by == 1 && h > 2000;
+        case CINE_PRESET_S35_HQ:    /* 1:1 in x5 zoom; Canon's own x5 is only ~1320 lines tall */
+            return lv_dispsize == 5 && bx == 1 && by == 1 && w > 3000 && h > 1500;
+        case CINE_PRESET_FF_SAFE:   /* Canon 1080p: 3x3 */
+            return lv_dispsize == 1 && bx == 3 && by == 3 && w <= 2000 && h <= 1300;
+    }
+    return 0;
+}
+
+static void cine_preset_apply(int id)
+{
+    const struct cine_preset_def * p = &cine_presets[id];
+    char notes[200] = "";
+    int restart = 0;
+
+    int have_cf = is_dir("A:/");
+    int have_sd = is_dir("B:/");
+    int span = p->spanning && have_cf && have_sd && cam_dualcard;
+    int bits = span ? p->bitdepth_span : p->bitdepth_cf;
+
+    /* crop_rec: sensor mode and bit depth */
+    struct menu_display_info info;
+    menu_set_str_value_from_script("Movie", "Presets", (char *) p->crop_rec, INT_MIN);   /* match by name only */
+    char * selected = menu_get_str_value_from_script("Movie", "Presets", &info);
+    if (!selected || !streq(selected, p->crop_rec))
+    {
+        STR_APPEND(notes, "\ncrop_rec: could not select %s.", p->crop_rec);
+    }
+    menu_set_value_from_script("Presets", "set 25fps", 0);
+    menu_set_value_from_script("Presets", "x3crop", 0);
+    menu_set_value_from_script("Movie", "Ratio", 0);
+    menu_set_value_from_script("Movie", "Bitdepth", bits);
+
+    /* mlv_lite */
+    raw_video_enabled   = 1;
+    output_format       = OUTPUT_14BIT_LOSSLESS;
+    resolution_index_x  = p->resolution;
+    res_x_fine          = 0;
+    aspect_ratio_index  = p->aspect;
+    card_spanning       = span;
+    pref_card           = (!span && cam_dualcard && have_cf) ? 1 : 0;  /* CF: faster */
+    pre_record          = 0;
+    rec_trigger         = 0;
+    h264_proxy_menu     = 0;
+    kill_gd             = 0;
+    dolly_mode          = 0;
+    prevmode            = p->crop_rec_preview;
+    preview_mode        = p->preview;
+
+    /* sound (mlv_snd), 48 kHz */
+    menu_set_value_from_script("Sound recording", "Enable sound", 1);
+    menu_set_value_from_script("Sound recording", "Sampling rate", 0);
+    if (menu_get_value_from_script("Sound recording", "Enable sound") != 1)
+    {
+        STR_APPEND(notes, "\nNO SOUND: mlv_snd is not loaded.");
+    }
+
+    /* no Dual ISO */
+    if (menu_get_value_from_script("Expo", "Dual ISO") > 0)
+    {
+        menu_set_value_from_script("Expo", "Dual ISO", 0);
+    }
+
+    if (span)
+    {
+        restart = cine_preset_setup_sd_overclock();
+    }
+
+    /* what we can't set from here */
+    if (!have_cf)
+    {
+        STR_APPEND(notes, "\nNo CF card: insert one.");
+    }
+    else if (p->spanning && !span)
+    {
+        STR_APPEND(notes, "\n%s", p->no_sd_note);
+    }
+    if (!is_movie_mode())
+    {
+        STR_APPEND(notes, "\nSet the LiveView switch to movie.");
+    }
+    else if (video_mode_resolution != 0 || video_mode_fps != 24)
+    {
+        STR_APPEND(notes, "\nCanon menu: Movie rec. size 1920x1080 24p.");
+    }
+    if (menu_get_value_from_script("Movie", "FPS override") > 0)
+    {
+        STR_APPEND(notes, "\nTurn FPS override OFF.");
+    }
+
+    /* remember what we did, and save now (not only at shutdown) */
+    cine_preset         = id;
+    cine_crop_index     = menu_get_value_from_script("Movie", "Presets");
+    cine_spanning       = span;
+    cine_bitdepth       = bits;
+    module_save_configs();
+
+    /* crop_rec applies the new sensor mode once the menu is closed */
+    gui_stop_menu();
+    NotifyBox(10000, "%s: applying...", p->name);
+    msleep(200);
+    if (lv && is_movie_mode() && p->zoom == 1 && lv_dispsize != 1)
+    {
+        /* back from the x5 preset; x5 itself is handled by crop_rec */
+        set_lv_zoom(1);
+    }
+
+    /* wait until the sensor is really in the new mode (crop_rec refreshes LiveView) */
+    int canon_mode_ok = is_movie_mode() && video_mode_resolution == 0 && video_mode_fps == 24;
+    if (lv && canon_mode_ok)
+    {
+        int ok = 0;
+        for (int i = 0; i < 40 && !ok; i++)
+        {
+            msleep(250);
+            ok = cine_preset_sensor_ok(id);
+        }
+        if (!ok)
+        {
+            STR_APPEND(notes, "\nSENSOR MODE NOT APPLIED: zoom x5 and back, or restart LiveView.");
+        }
+    }
+
+    cine_preset_update_state();
+
+    NotifyBox(restart ? 10000 : 5000, "%s ready%s%s%s",
+        p->name,
+        span ? " (CF+SD)" : "",
+        notes,
+        restart ? "\nRestart the camera once (SD overclock)." : ""
+    );
+}
+
+static void cine_preset_task(void * priv)
+{
+    int id = (int) priv;
+    if (cine_preset_valid(id))
+    {
+        cine_preset_apply(id);
+    }
+    cine_preset_busy = 0;
+}
+
+static MENU_SELECT_FUNC(cine_preset_select)
+{
+    if (RECORDING)
+    {
+        NotifyBox(2000, "Stop recording first.");
+        return;
+    }
+
+    if (cine_preset_busy)
+    {
+        return;
+    }
+
+    /* setting other modules' menus waits for them; don't do it from the GUI task */
+    cine_preset_busy = 1;
+    task_create("cine_preset", 0x1e, 0x1000, cine_preset_task, priv);
+}
+
+static MENU_UPDATE_FUNC(cine_preset_menu_update)
+{
+    if (cine_preset_valid(cine_preset))
+    {
+        MENU_SET_VALUE("%s%s", cine_presets[cine_preset].name, cine_preset_unchanged() ? "" : " (modified)");
+    }
+    else
+    {
+        MENU_SET_VALUE("---");
+    }
+}
+
+static MENU_UPDATE_FUNC(cine_preset_entry_update)
+{
+    int id = (int) entry->priv;
+    if (cine_preset == id && cine_preset_unchanged())
+    {
+        MENU_SET_RINFO("active");
+    }
+}
+
+static struct menu_entry cine_preset_menu[] =
+{
+    {
+        .name       = "Cine presets",
+        .select     = menu_open_submenu,
+        .update     = cine_preset_menu_update,
+        .submenu_width = 700,
+        .depends_on = DEP_MOVIE_MODE,
+        .help       = "One click: sensor mode, bit depth, cards, preview, sound, SD overclock.",
+        .help2      = "Needs Canon movie mode 1920x1080 24p. A * in the top bar means you changed something.",
+        .children   = (struct menu_entry[]) {
+            {
+                .name       = "FF HQ",
+                .priv       = (void *) CINE_PRESET_FF_HQ,
+                .select     = cine_preset_select,
+                .update     = cine_preset_entry_update,
+                .icon_type  = IT_ACTION,
+                .help       = "5.7K 1x3 full frame, 14-bit lossless, CF+SD. Main mode, best overall.",
+                .help2      = "1920x2340 raw, desqueeze x3 in post (5760x2340, 2.46:1). 10-bit without SD.",
+            },
+            {
+                .name       = "S35 HQ",
+                .priv       = (void *) CINE_PRESET_S35_HQ,
+                .select     = cine_preset_select,
+                .update     = cine_preset_entry_update,
+                .icon_type  = IT_ACTION,
+                .help       = "3.5K 1:1 centered (x5 zoom), ~1.6x crop, 10-bit lossless, CF+SD.",
+                .help2      = "Maximum detail: 3584x1730, no binning. Gray preview while recording.",
+            },
+            {
+                .name       = "FF SAFE",
+                .priv       = (void *) CINE_PRESET_FF_SAFE,
+                .select     = cine_preset_select,
+                .update     = cine_preset_entry_update,
+                .icon_type  = IT_ACTION,
+                .help       = "1920x1280 3x3 full frame, 14-bit lossless, CF only. Light and reliable.",
+                .help2      = "Color real-time preview, no sensor hacks: for movement and important takes.",
+            },
+            MENU_EOL,
+        },
+    },
+};
+
+static LVINFO_UPDATE_FUNC(cine_preset_info)
+{
+    LVINFO_BUFFER(12);
+
+    if (!cam_5d3 || !cine_preset_valid(cine_preset) || !is_movie_mode())
+    {
+        return;
+    }
+
+    snprintf(buffer, sizeof(buffer), "%s%s", cine_presets[cine_preset].name, cine_preset_unchanged() ? "" : "*");
+}
+
 static struct lvinfo_item info_items[] = {
     /* Top bar */
     {
@@ -4823,6 +5280,13 @@ static struct lvinfo_item info_items[] = {
         .update = recording_status,
         .preferred_position = 50,
         .priority = 10,
+    },
+    {
+        .name = "Cine preset",
+        .which_bar = LV_TOP_BAR_ONLY,
+        .update = cine_preset_info,
+        .preferred_position = 40,
+        .priority = 2,
     }
 };
 
@@ -4878,6 +5342,11 @@ static unsigned int raw_rec_init()
     }
 
     menu_add("Movie", raw_video_menu, COUNT(raw_video_menu));
+
+    if (cam_5d3)
+    {
+        menu_add("Movie", cine_preset_menu, COUNT(cine_preset_menu));
+    }
 
     /* hack: force proper alignment in menu */
     raw_video_menu->children->parent_menu->split_pos = 15;
@@ -4939,6 +5408,10 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(cam_letter)
     MODULE_CONFIG(reel_number)
     MODULE_CONFIG(clip_number)
+    MODULE_CONFIG(cine_preset)
+    MODULE_CONFIG(cine_crop_index)
+    MODULE_CONFIG(cine_spanning)
+    MODULE_CONFIG(cine_bitdepth)
     MODULE_CONFIG(pref_card)
     MODULE_CONFIG(raw_video_enabled)
     MODULE_CONFIG(resolution_index_x)
