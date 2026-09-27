@@ -2882,6 +2882,27 @@ static LVINFO_UPDATE_FUNC(tv_update)
     }
 }
 
+/* movie mode: shutter angle, e.g. 180deg at 1/48 and 23.976 fps (also correct with FPS override / crop_rec) */
+static LVINFO_UPDATE_FUNC(shutter_angle_update)
+{
+    LVINFO_BUFFER(8);
+
+    if (!is_movie_mode() || is_bulb_mode())
+    {
+        return;
+    }
+
+    int s = get_current_shutter_reciprocal_x1000();
+    int fps = fps_get_current_x1000();
+    if (s <= 0 || fps <= 0)
+    {
+        return;
+    }
+
+    int deg = (3600 * fps / s + 5) / 10;
+    snprintf(buffer, sizeof(buffer), "%d"SYM_DEGREE, deg);
+}
+
 static int (*dual_iso_is_active)() = MODULE_FUNCTION(dual_iso_is_active);
 static int (*dual_iso_get_recovery_iso)() = MODULE_FUNCTION(dual_iso_get_recovery_iso);
 
@@ -3243,6 +3264,12 @@ static struct lvinfo_item info_items[] = {
         .which_bar = LV_BOTTOM_BAR_ONLY,
         .update = tv_update,
         .priority = 1,
+    },
+    {
+        .name = "Shutter angle",
+        .which_bar = LV_BOTTOM_BAR_ONLY,
+        .update = shutter_angle_update,
+        .priority = -1,
     },
     {
         .name = "ISO",

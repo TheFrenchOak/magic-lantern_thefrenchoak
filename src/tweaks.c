@@ -2835,6 +2835,18 @@ static CONFIG_INT("anamorphic.preview", anamorphic_preview, 0);
 static int anamorphic_ratio_num[10] = {5, 4, 7, 3, 5, 9, 2, 3};
 static int anamorphic_ratio_den[10] = {4, 3, 5, 2, 3, 5, 1, 1};
 
+/* squeeze factor of the anamorphic lens (x1000; 1000 = OFF) */
+/* for raw video previews (mlv_lite), which replace the LiveView image and bypass our display filter */
+int get_anamorphic_preview_squeeze_x1000()
+{
+    if (!anamorphic_preview)
+    {
+        return 1000;
+    }
+
+    return anamorphic_ratio_num[anamorphic_ratio_idx] * 1000 / anamorphic_ratio_den[anamorphic_ratio_idx];
+}
+
 static MENU_UPDATE_FUNC(anamorphic_preview_display)
 {
     /*
@@ -3558,6 +3570,7 @@ static struct menu_entry display_menus[] = {
         .max = 8,
         .choices = (const char *[]) {"OFF", "5:4 (1.25)", "4:3 (1.33)", "7:5 (1.4)", "3:2 (1.5)", "5:3 (1.66)", "9:5 (1.8)", "2:1", "3:1"},
         .help = "Stretches LiveView image vertically, for anamorphic lenses.",
+        .help2 = "Also applied to the RAW video framing preview (mlv_lite).",
         .depends_on = DEP_LIVEVIEW | DEP_GLOBAL_DRAW,
 /*
         .children =  (struct menu_entry[]) {

@@ -31,6 +31,8 @@
 #include <propvalues.h>
 #include <raw.h>
 #include <ml-cbr.h>
+#include <lvinfo.h>
+#include <zebra.h>
 
 #include "../trace/trace.h"
 #include "../mlv_rec/mlv.h"
@@ -49,6 +51,7 @@ static CONFIG_INT("mlv.snd.bit.depth", mlv_snd_in_bits_per_sample, 16);
 static CONFIG_INT("mlv.snd.sample.rate", mlv_snd_in_sample_rate, 48000);
 static CONFIG_INT("mlv.snd.sample.rate.selection", mlv_snd_rate_sel, 0);
 static CONFIG_INT("mlv.snd.vsync_delay", mlv_snd_vsync_delay, 1);
+static CONFIG_INT("mlv.snd.meters", mlv_snd_meters, 1);
 
 extern int StartASIFDMAADC(void *, uint32_t, void *, uint32_t, void (*)(), uint32_t);
 extern int SetNextASIFADCBuffer(void *, uint32_t);
@@ -66,6 +69,7 @@ extern int32_t mlv_rec_get_free_slot();
 extern void mlv_rec_release_slot(int32_t slot, uint32_t write);
 extern void mlv_rec_set_rel_timestamp(mlv_hdr_t *hdr, uint64_t timestamp);
 extern void mlv_rec_skip_frames(uint32_t count);
+extern WEAK_FUNC(ret_0) int mlv_rec_uses_pre_recording();
 
 static struct msg_queue * volatile mlv_snd_buffers_empty = NULL;
 static struct msg_queue * volatile mlv_snd_buffers_done = NULL;
@@ -112,6 +116,10 @@ audio_data_t *mlv_snd_next_buffer = NULL;
 
 static uint32_t mlv_snd_state = MLV_SND_STATE_IDLE;
 
+/* set by mlv_snd_asif_in_cbr (interrupt) when audio had to stop while video keeps recording;
+ * reported by the writer task, since we can't show messages from the interrupt */
+static volatile uint32_t mlv_snd_dropout = 0;
+
 /* this tells the audio backend that we are going to record sound */
 static ml_cbr_action mlv_snd_snd_rec_cbr (const char *event, void *data)
 {
@@ -154,12 +162,14 @@ static void mlv_snd_asif_in_cbr()
             if(msg_queue_count(mlv_snd_buffers_empty, &count))
             {
                 trace_write(trace_ctx, "mlv_snd_asif_in_cbr: msg_queue_count failed");
+                mlv_snd_dropout = 1;
                 mlv_snd_state = MLV_SND_STATE_SOUND_STOP_ASIF;
                 return;
             }
             if(count < 1)
             {
                 trace_write(trace_ctx, "mlv_snd_asif_in_cbr: no free buffers available");
+                mlv_snd_dropout = 1;
                 mlv_snd_state = MLV_SND_STATE_SOUND_STOP_ASIF;
                 return;
             }
@@ -168,6 +178,7 @@ static void mlv_snd_asif_in_cbr()
             if(msg_queue_receive(mlv_snd_buffers_empty, &mlv_snd_next_buffer, 10))
             {
                 trace_write(trace_ctx, "mlv_snd_asif_in_cbr: msg_queue_receive(mlv_snd_buffers_empty, ) failed");
+                mlv_snd_dropout = 1;
                 mlv_snd_state = MLV_SND_STATE_SOUND_STOP_ASIF;
                 return;
             }
@@ -367,6 +378,90 @@ static void mlv_snd_alloc_buffers()
     }
 }
 
+/* peak meters, drawn above the bottom info bar while recording */
+#define MLV_SND_METER_SEGMENTS 20   /* 3 dB each, -60 ... 0 dBFS */
+#define MLV_SND_METER_SEG_W    12   /* 8 px segment + 4 px gap; bmp_fill works in 4-pixel steps horizontally */
+#define MLV_SND_METER_H        6
+#define MLV_SND_METER_X        12
+
+/* 16-bit peak values for -3, -6, ... -60 dBFS */
+static const uint16_t mlv_snd_meter_steps[MLV_SND_METER_SEGMENTS] = {
+    23197, 16422, 11626, 8231, 5827, 4125, 2920, 2067, 1464, 1036,
+    734, 519, 368, 260, 184, 130, 92, 65, 46, 33
+};
+
+static int mlv_snd_meter_y()
+{
+    return get_ml_bottombar_pos() - 2 * (MLV_SND_METER_H + 2) - 4;
+}
+
+static int mlv_snd_meters_visible()
+{
+    return mlv_snd_meters && lv && get_global_draw() && !gui_menu_shown() && liveview_display_idle();
+}
+
+static void mlv_snd_draw_meter(int channel, int peak)
+{
+    /* number of lit segments: 20 means above -3 dBFS */
+    int level = 0;
+    for (int k = 0; k < MLV_SND_METER_SEGMENTS; k++)
+    {
+        if (peak >= mlv_snd_meter_steps[k])
+        {
+            level = MLV_SND_METER_SEGMENTS - k;
+            break;
+        }
+    }
+
+    int y = mlv_snd_meter_y() + channel * (MLV_SND_METER_H + 2);
+    for (int seg = 1; seg <= MLV_SND_METER_SEGMENTS; seg++)
+    {
+        /* green below -12 dBFS, yellow up to -6, red above; dark when off */
+        int color =
+            (seg > level)                        ? COLOR_GRAY(20) :
+            (seg > MLV_SND_METER_SEGMENTS - 2)   ? COLOR_RED      :
+            (seg > MLV_SND_METER_SEGMENTS - 4)   ? COLOR_YELLOW   :
+                                                   COLOR_GREEN1   ;
+        bmp_fill(color, MLV_SND_METER_X + (seg - 1) * MLV_SND_METER_SEG_W, y, MLV_SND_METER_SEG_W - 4, MLV_SND_METER_H);
+    }
+
+    /* clip indicator (about -0.2 dBFS) */
+    bmp_fill(peak >= 32000 ? COLOR_RED : COLOR_GRAY(20), MLV_SND_METER_X + MLV_SND_METER_SEGMENTS * MLV_SND_METER_SEG_W + 4, y, 8, MLV_SND_METER_H);
+}
+
+/* called from the writer task for each filled buffer (16-bit stereo, interleaved) */
+static void mlv_snd_update_meters(int16_t * data, uint32_t length)
+{
+    if (!mlv_snd_meters_visible())
+    {
+        return;
+    }
+
+    int peak[2] = { 0, 0 };
+    uint32_t samples = length / sizeof(int16_t);
+    for (uint32_t i = 0; i + 1 < samples; i += 2)
+    {
+        int l = ABS((int) data[i]);
+        int r = ABS((int) data[i + 1]);
+        if (l > peak[0]) peak[0] = l;
+        if (r > peak[1]) peak[1] = r;
+    }
+
+    mlv_snd_draw_meter(0, peak[0]);
+    mlv_snd_draw_meter(1, peak[1]);
+}
+
+static void mlv_snd_clear_meters()
+{
+    if (!mlv_snd_meters || !lv || gui_menu_shown())
+    {
+        return;
+    }
+
+    bmp_fill(COLOR_EMPTY, MLV_SND_METER_X, mlv_snd_meter_y(),
+        MLV_SND_METER_SEGMENTS * MLV_SND_METER_SEG_W + 16, 2 * (MLV_SND_METER_H + 2));
+}
+
 static void mlv_snd_writer(int unused)
 {
     uint32_t done = 0;
@@ -384,6 +479,13 @@ static void mlv_snd_writer(int unused)
         {
             case MLV_SND_STATE_SOUND_STOP_TASK:
                 trace_write(trace_ctx, "   --> WRITER: exiting");
+                if (mlv_snd_dropout)
+                {
+                    /* audio stopped on its own, but the video keeps recording */
+                    NotifyBox(5000, "Audio stopped (out of buffers). Video continues WITHOUT sound!");
+                    beep_times(3);
+                }
+                mlv_snd_clear_meters();
                 done = 1;
                 break;
                 
@@ -410,6 +512,8 @@ static void mlv_snd_writer(int unused)
                 
                 mlv_audf_hdr_t *hdr = (mlv_audf_hdr_t *)buffer->mlv_slot_buffer;
                 mlv_set_type((mlv_hdr_t *)hdr, "AUDF");
+                
+                mlv_snd_update_meters((int16_t *) buffer->data, buffer->length);
                 
                 /* fill recording information */
                 hdr->frameNumber = buffer->frameNumber;
@@ -503,6 +607,7 @@ static void mlv_snd_cbr_starting(uint32_t event, void *ctx, mlv_hdr_t *hdr)
     mlv_snd_alloc_buffers();
     
     /* reset all variables first */
+    mlv_snd_dropout = 0;
     mlv_snd_file_num = UINT16_MAX;
     mlv_snd_frame_number = 0;
     mlv_snd_frames_queued = 0;
@@ -649,11 +754,26 @@ static void mlv_snd_trace_buf(char *caption, uint8_t *buffer, uint32_t length)
 }
 
 
+static MENU_UPDATE_FUNC(mlv_snd_menu_update)
+{
+    if (!mlv_snd_enabled)
+    {
+        return;
+    }
+
+    /* audio keeps running while mlv_lite pre-records or pauses (rec trigger), video does not */
+    if (mlv_rec_uses_pre_recording())
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Pre-record / rec trigger: audio may be out of sync with the video.");
+    }
+}
+
 static struct menu_entry mlv_snd_menu[] =
 {
     {
         .name       = "Sound recording",
         .select     = menu_open_submenu,
+        .update     = mlv_snd_menu_update,
         .priv       = &mlv_snd_enabled,
         .help       = "Sound recording options provided by mlv_snd.",
         .children   = (struct menu_entry[])
@@ -678,6 +798,13 @@ static struct menu_entry mlv_snd_menu[] =
                 .min = 0,
                 .max = 32,
                 .help = "Delay the audio that many frames. (experimental)",
+            },
+            {
+                .name       = "Audio meters",
+                .priv       = &mlv_snd_meters,
+                .max        = 1,
+                .help       = "[mlv_snd] Show L/R peak meters while recording (-60...0 dBFS, 3 dB steps).",
+                .help2      = "Green below -12 dBFS, yellow up to -6, red above. The box on the right is clipping.",
             },
             {
                 .name       = "Trace output",
@@ -753,6 +880,7 @@ MODULE_CBRS_END()
 
 MODULE_CONFIGS_START()
     MODULE_CONFIG(mlv_snd_enabled)
+    MODULE_CONFIG(mlv_snd_meters)
     MODULE_CONFIG(mlv_snd_enable_tracing)
     MODULE_CONFIG(mlv_snd_in_bits_per_sample)
     MODULE_CONFIG(mlv_snd_rate_sel)

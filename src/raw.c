@@ -2001,6 +2001,47 @@ int raw_lv_settings_still_valid()
 #define QG ((int)(q->g_lo | (q->g_hi << 2)))
 #define QH ((int)(q->h))
 
+/* read one pixel at any bit depth (10, 12 or 14), scaled to 14 bits;
+ * pixels are packed MSB first, in 16-bit words (same layout as struct raw_pixblock for 14 bits) */
+static inline int FAST raw_preview_get_pixel(void * raw_buffer, int x, int y, int bpp)
+{
+    uint16_t * line = (uint16_t *)((uint8_t *) raw_buffer + y * raw_info.pitch);
+    int bit = x * bpp;
+    int w = bit >> 4;
+    int s = bit & 15;
+    uint32_t window = (uint32_t) line[w] << 16;
+    if (s + bpp > 16) window |= line[w + 1];
+    return ((window >> (32 - s - bpp)) & ((1 << bpp) - 1)) << (14 - bpp);
+}
+
+/* the preview gamma curves only depend on black and white levels;
+ * recompute them only when these change, not on every preview frame */
+static uint8_t preview_gamma_rb[1024];
+static uint8_t preview_gamma_g[1024];
+static int preview_gamma_black = -1;
+static int preview_gamma_white = -1;
+
+static void FAST raw_preview_update_gamma(int black, int white, int div)
+{
+    if (black == preview_gamma_black && white == preview_gamma_white)
+    {
+        return;
+    }
+
+    for (int i = 0; i < 1024; i++)
+    {
+        /* only show 10 bits */
+        int g_rb = COERCE(raw_to_ev((i << div) + black) + 11, 0, 10) * 255 / 10;
+        int g_g  = COERCE(raw_to_ev((i << div) + black) + 10, 0, 10) * 255 / 10;
+        /* gamma 2 */
+        preview_gamma_rb[i] = COERCE(g_rb * g_rb / 255, 0, 255);
+        preview_gamma_g[i]  = COERCE(g_g  * g_g  / 255, 0, 255);
+    }
+
+    preview_gamma_black = black;
+    preview_gamma_white = white;
+}
+
 static void FAST raw_preview_color_work(void* raw_buffer, void* lv_buffer, int y1, int y2)
 {
     dbg_printf("Raw color preview...\n");
@@ -2030,18 +2071,11 @@ static void FAST raw_preview_color_work(void* raw_buffer, void* lv_buffer, int y
     }
 
     /* white balance 2,1,2 => use two gamma curves to simplify code */
-    uint8_t gamma_rb[1024];
-    uint8_t gamma_g[1024];
+    raw_preview_update_gamma(black, white, div);
+    uint8_t * gamma_rb = preview_gamma_rb;
+    uint8_t * gamma_g  = preview_gamma_g;
 
-    for (int i = 0; i < 1024; i++)
-    {
-        /* only show 10 bits */
-        int g_rb = COERCE(raw_to_ev((i << div) + black) + 11, 0, 10) * 255 / 10;
-        int g_g  = COERCE(raw_to_ev((i << div) + black) + 10, 0, 10) * 255 / 10;
-        /* gamma 2 */
-        gamma_rb[i] = COERCE(g_rb * g_rb / 255, 0, 255);
-        gamma_g[i]  = COERCE(g_g  * g_g  / 255, 0, 255);
-    }
+    int bpp = raw_info.bits_per_pixel;
     
     int x1 = COERCE(RAW2LV_X(preview_rect_x), 0, vram_lv.width);
     int x2 = COERCE(RAW2LV_X(preview_rect_x + preview_rect_w), 0, vram_lv.width);
@@ -2083,7 +2117,15 @@ static void FAST raw_preview_color_work(void* raw_buffer, void* lv_buffer, int y
             
             /* RGGB cell */
             /* note: at 1920 horizontal resolution in raw, downsampling by 8 would result in 240px horizontally => looks ugly */
-            switch (xr%8)
+            if (bpp != 14)
+            {
+                /* 10/12-bit raw stream (mlv_lite uncompressed): slower, generic unpacking */
+                r = raw_preview_get_pixel(raw, xr,     yr,     bpp);
+                g = (raw_preview_get_pixel(raw, xr + 1, yr,     bpp) +
+                     raw_preview_get_pixel(raw, xr,     yr + 1, bpp)) >> 1;
+                b = raw_preview_get_pixel(raw, xr + 1, yr + 1, bpp);
+            }
+            else switch (xr%8)
             {
                 case 0:
                     r = PA;
@@ -2141,7 +2183,6 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
     }
 
     /* scale useful range (black...white) to 0...1023 or less */
-    /* changing from 1024 to 700 for speed reasons */
     int black = raw_info.black_level;
     int white = raw_info.white_level;
     int div = 0;
@@ -2150,14 +2191,11 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
         div++;
     }
 
-    uint8_t gamma[1024];
-    
-    for (int i = 0; i < 1024; i++)
-    {
-        /* only show 10 bits */
-        int g = COERCE(raw_to_ev((i << div) + black) + 10, 0, 10) * 255 / 10;
-        gamma[i] = g * g / 255; /* gamma 2 */
-    }
+    /* same curve as the green channel in the color preview (gamma 2, 10 stops) */
+    raw_preview_update_gamma(black, white, div);
+    uint8_t * gamma = preview_gamma_g;
+
+    int bpp = raw_info.bits_per_pixel;
     
     int x1 = COERCE(RAW2LV_X(preview_rect_x), 0, vram_lv.width);
     int x2 = COERCE(RAW2LV_X(preview_rect_x + preview_rect_w), 0, vram_lv.width);
@@ -2194,7 +2232,7 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
         {
             int xr = lv2rx[x];
             struct raw_pixblock * p = row + (xr/8);
-            int c = p->a;
+            int c = (bpp == 14) ? p->a : raw_preview_get_pixel(raw, xr & ~7, yr, bpp);
             uint64_t Y = gamma[COERCE(c - black, 0, white-black) >> div];
             Y = (Y << 8) | (Y << 24) | (Y << 40) | (Y << 56);
             int idx = LV(x,y)/8;
@@ -2207,7 +2245,10 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
 
 void FAST raw_preview_fast_ex(void* raw_buffer, void* lv_buffer, int y1, int y2, int quality)
 {
-    if (raw_info.bits_per_pixel != 14)
+    /* 10 and 12 bits use a slower unpacking path */
+    if (raw_info.bits_per_pixel != 14 &&
+        raw_info.bits_per_pixel != 12 &&
+        raw_info.bits_per_pixel != 10)
         return;
 
     yuv422_buffer_check();

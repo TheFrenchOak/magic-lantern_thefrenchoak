@@ -606,7 +606,10 @@ hist_build()
 
 #ifdef FEATURE_RAW_ZEBRAS
 
-static CONFIG_INT("raw.zebra", raw_zebra_enable, 2); /* 1 = always, 2 = photo only */
+/* 1 = always, 2 = photo only
+ * default: always, so RAW video (mlv_lite) gets zebras from the raw data, not from the preview;
+ * in movie mode this doesn't enable the raw stream by itself (see can_use_raw_overlays) */
+static CONFIG_INT("raw.zebra", raw_zebra_enable, 1);
 #define RAW_ZEBRA_ENABLE (raw_zebra_enable == 1 || (raw_zebra_enable == 2 && !lv))
 
 static void FAST draw_zebras_raw()

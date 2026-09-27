@@ -1,0 +1,28 @@
+# Build outputs.
+# Some of these are still tracked (committed before this file existed);
+# to stop tracking them without deleting them: git rm -r --cached <path>
+
+# objects, dependencies, modules
+*.o
+*.d
+*.dep
+*.mo
+*.pyc
+modules/*/hgstamp
+modules/*/module_strings.h
+modules/*/*.sym
+
+# platform builds
+platform/*/autoexec
+platform/*/autoexec.bin
+platform/*/autoexec.map
+platform/*/magiclantern
+platform/*/magiclantern.bin
+platform/*/magiclantern.lds
+platform/*/magiclantern.sym
+platform/*/location.map
+platform/*/version.c
+platform/*/version.bin
+
+# the Mercurial store is tracked in this repo; don't let the patterns above hide its *.d files
+!.hg/**

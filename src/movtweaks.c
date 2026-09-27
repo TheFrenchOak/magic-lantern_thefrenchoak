@@ -923,6 +923,35 @@ static struct menu_entry mov_menus[] = {
         },
     },
     #endif
+    #ifdef FEATURE_REC_NOTIFY
+    {
+        .name = "REC/STBY notif",
+        .priv = &rec_notify,
+        .help = "Recording tally: show clearly whether you are recording (H.264 or RAW).",
+        #define REC_NOTIFY_HELP_COMMON \
+                 "OFF\n" \
+                 "Red crossed rectangle on screen while NOT recording.\n" \
+                 "REC / STBY label in the top right corner.\n"
+        #if defined(CONFIG_BLUE_LED) && defined(FEATURE_REC_NOTIFY_BEEP)
+        .max = 4,
+        .choices = CHOICES("OFF", "Red Crossout", "REC/STBY", "Blue LED", "Beep"),
+        .help2 = REC_NOTIFY_HELP_COMMON "Blue LED on while recording.\n" "Beep when starting/stopping.\n",
+        #elif defined(CONFIG_BLUE_LED)
+        .max = 3,
+        .choices = CHOICES("OFF", "Red Crossout", "REC/STBY", "Blue LED"),
+        .help2 = REC_NOTIFY_HELP_COMMON "Blue LED on while recording.\n",
+        #elif defined(FEATURE_REC_NOTIFY_BEEP)
+        .max = 3,
+        .choices = CHOICES("OFF", "Red Crossout", "REC/STBY", "Beep"),
+        .help2 = REC_NOTIFY_HELP_COMMON "Beep when starting/stopping.\n",
+        #else
+        .max = 2,
+        .choices = CHOICES("OFF", "Red Crossout", "REC/STBY"),
+        .help2 = REC_NOTIFY_HELP_COMMON,
+        #endif
+        .depends_on = DEP_MOVIE_MODE,
+    },
+    #endif
     #ifdef FEATURE_GRADUAL_EXPOSURE
     {
         .name = "Gradual Exposure",

@@ -25,13 +25,16 @@ static int is_digic4 = 0;
 static int is_digic5 = 0;
 static int is_5D3 = 0;
 
-//Not static so we can get info in mlv_lite regarding crop rec on or off
-CONFIG_INT("crop.preset", crop_preset_index, 1);
+/* Settings that change the sensor configuration are edited through the *_cfg variables
+ * (saved in config), but the hooks only use the "active" copies below. The active copies
+ * are synced from the menu only while not recording (see crop_rec_sync_settings),
+ * so changing them from the menu can't alter the geometry or timing in the middle of a clip. */
+static CONFIG_INT("crop.preset", crop_preset_index_cfg, 1);
 static CONFIG_INT("crop.shutter_range", shutter_range, 0);
-static CONFIG_INT("crop.ratios", ratios, 1);
-static CONFIG_INT("crop.x3crop", x3crop, 0);
+static CONFIG_INT("crop.ratios", ratios_cfg, 0);
+static CONFIG_INT("crop.x3crop", x3crop_cfg, 0);
 static CONFIG_INT("crop.zoomaid", zoomaid, 0);
-static CONFIG_INT("crop.set_25fps", set_25fps, 0);
+static CONFIG_INT("crop.set_25fps", set_25fps_cfg, 0);
 static CONFIG_INT("crop.framestop", framestop, 0);
 static CONFIG_INT("crop.frameburst", frameburst, 0);
 static CONFIG_INT("crop.isoaverage", isoaverage, 0);
@@ -39,7 +42,14 @@ static CONFIG_INT("crop.isoclimb", isoclimb, 0);
 static CONFIG_INT("crop.presets", presets, 0);
 
 CONFIG_INT("crop.isoauto", isoauto, 0); /* to be read in mlv_lite.c */
-CONFIG_INT("crop.bitdepth", bitdepth, 4); /* non static or it can´t be read in mlv_lite.c. See definitions bottom of raw.h */
+static CONFIG_INT("crop.bitdepth", bitdepth_cfg, 4);
+
+/* active copies; crop_preset_index and bitdepth are not static, mlv_lite.c reads them */
+int crop_preset_index = 1;
+int bitdepth = 4;   /* see definitions bottom of raw.h */
+static int ratios = 0;
+static int x3crop = 0;
+static int set_25fps = 0;
 #define OUTPUT_8BIT (bitdepth == 1)
 #define OUTPUT_9BIT (bitdepth == 2)
 #define OUTPUT_10BIT (bitdepth == 3)
@@ -78,6 +88,9 @@ static enum crop_preset * crop_presets = 0;
 
 /* current menu selection (*/
 #define CROP_PRESET_MENU crop_presets[crop_preset_index]
+
+/* what is currently selected in the menu (may differ from CROP_PRESET_MENU while recording) */
+#define CROP_PRESET_SELECTED crop_presets[crop_preset_index_cfg]
 
 /* menu choices for 5D3 */
 static enum crop_preset crop_presets_5d3[] = {
@@ -138,7 +151,7 @@ static const char crop_choices_help2_5d3[] =
 "1920x1050 @ 48p, 3x3 binning (50/60 FPS in Canon menu)\n"
 "1920x960 @ 50p, 3x3 binning (50/60 FPS in Canon menu)\n"
 "1920x804 @ 60p, 3x3 binning (50/60 FPS in Canon menu)\n"
-"1:1 4K UHD crop (3840x1600 @ 24p, square raw pixels, preview broken)\n"
+"1:1 4K UHD crop (3840x1536 @ 24p, square raw pixels, preview broken)\n"
 "1:1 4K crop (4096x3072 @ 12.5 fps, half frame rate, preview broken)\n"
 "Full resolution LiveView (5796x3870 @ 7.4 fps, 5784x3864, preview broken)\n"
 "anamorphic fullres 1920x3760 (extreme anamorphic)\n"
@@ -1004,7 +1017,7 @@ static void FAST cmos_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         
         data_buf++;
         copy_ptr++;
-        if (copy_ptr > copy_end) while(1);
+        if (copy_ptr >= copy_end) while(1);
     }
     *copy_ptr = 0xFFFF;
     
@@ -1048,6 +1061,7 @@ static int FAST adtg_lookup(uint32_t* data_buf, int reg_needle)
         {
             return *(uint16_t*)data_buf;
         }
+        data_buf++;
     }
     return -1;
 }
@@ -1348,7 +1362,7 @@ static void FAST adtg_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     if (1)
     {
         /* assuming FPS timer B was overridden before this */
-        int fps_timer_b = (shamem_read(0xC0F06014) & (0xFFFF + reg_timing5));
+        int fps_timer_b = (shamem_read(0xC0F06014) & 0xFFFF) + reg_timing5;
         int readout_end = shamem_read(is_digic4 ? 0xC0F06088 : 0xC0F06804) >> 16;
         
         /* PowerSaveTiming registers */
@@ -1537,10 +1551,8 @@ static inline uint32_t reg_override_common(uint32_t reg, uint32_t old_val)
     uint32_t a = reg_override_top_bar(reg, old_val);
     if (a) return a;
     
-    uint32_t b = reg_override_HEAD34(reg, old_val);
-    if (b) return b;
-    
-    return reg_override_bits(reg, old_val);
+    /* falls back to reg_override_bits */
+    return reg_override_HEAD34(reg, old_val);
 }
 
 static inline uint32_t reg_override_fps(uint32_t reg, uint32_t timerA, uint32_t timerB, uint32_t old_val)
@@ -1987,15 +1999,18 @@ static inline uint32_t reg_override_1x3(uint32_t reg, uint32_t old_val)
         (!set_25fps && !ratios) ? 0x94a + reg_713c:
         0x93a + reg_713c;
             
+        /* registers hold timer - 1; 24 MHz / (A * B) must be exact:
+         * 23.976p: A = 385, B = 2600 (385 x 2600 = 1001000)
+         * 25p:     A = 384, B = 2500 (384 x 2500 =  960000; was 385 x 2494 = 24.995 fps) */
         case 0xC0F06014:
-            return set_25fps ? 0x9bd + reg_6014: 0xa27 + reg_6014;
+            return set_25fps ? 0x9c3 + reg_6014: 0xa27 + reg_6014;
         case 0xC0F06008:
         case 0xC0F0600C:
-            return 0x1800180 + reg_6008 + (reg_6008 << 16);
+            return set_25fps ? 0x17f017f + reg_6008 + (reg_6008 << 16) : 0x1800180 + reg_6008 + (reg_6008 << 16);
         case 0xC0F06010:
-            return 0x180 + reg_6008;
+            return set_25fps ? 0x17f + reg_6008 : 0x180 + reg_6008;
     }
-    
+
     return reg_override_bits(reg, old_val);
 }
 
@@ -2024,12 +2039,14 @@ static inline uint32_t reg_override_anamorph_fullres(uint32_t reg, uint32_t old_
 static inline uint32_t reg_override_mv1080_mv720p(uint32_t reg, uint32_t old_val)
 {
     
+    /* registers hold timer - 1: A = 400, B = 1500 -> exactly 40.000 fps
+     * (was A = 397, B = 1512 -> 39.982 fps, with A below the 398 minimum from fps-engio.c) */
     switch (reg)
     {
-        case 0xC0F06014: return 0x5e7 + reg_6014;
-        case 0xC0F0600c: return 0x18c018c + reg_6008 + (reg_6008 << 16);
-        case 0xC0F06008: return 0x18c018c + reg_6008 + (reg_6008 << 16);
-        case 0xC0F06010: return 0x18c + reg_6008;
+        case 0xC0F06014: return 0x5db + reg_6014;
+        case 0xC0F0600c: return 0x18f018f + reg_6008 + (reg_6008 << 16);
+        case 0xC0F06008: return 0x18f018f + reg_6008 + (reg_6008 << 16);
+        case 0xC0F06010: return 0x18f + reg_6008;
             
         case 0xC0F0713c: return 0x51d + reg_713c;
         case 0xC0F07150: return 0x4c3 + reg_7150;
@@ -2092,13 +2109,26 @@ static inline uint32_t reg_override_zoom_fps(uint32_t reg, uint32_t old_val)
     (video_mode_fps == 60) ? 1540 :
     -1 ;
     
+    /* raw end line; timer B must stay well above it (about 160 lines of margin in all working presets)
+     * 24p:     0x700 = 1792 lines, B = 1955
+     * 25p/50p: 0x6b0 = 1712 lines, B = 1875
+     * 30p/60p: B = 1540 can't read more than Canon's x5 height (0x566), so leave it unchanged;
+     *          1792 lines would take 38.8 ms, longer than the 33.4 ms frame (corrupted frames) */
+    int height =
+    (video_mode_fps == 24) ? 0x700 :
+    (video_mode_fps == 25) ? 0x6b0 :
+    (video_mode_fps == 50) ? 0x6b0 :
+    0 ;
+    
     switch (reg)
     {
         case 0xC0F06804:
-            return (video_mode_fps == 25) ?  0x6b001eb + reg_6804_width + (reg_6804_height << 16): 0x70001eb + reg_6804_width + (reg_6804_height << 16);
+            if (!height) break;
+            return (height << 16) + 0x1eb + reg_6804_width + (reg_6804_height << 16);
             
         case 0xC0F0713c:
-            return (video_mode_fps == 25) ? 0x6b0 + reg_713c: 0x700 + reg_713c;
+            if (!height) break;
+            return height + reg_713c;
     }
      
     return reg_override_fps_nocheck(reg, timerA, timerB, old_val);
@@ -2255,13 +2285,24 @@ PROP_HANDLER(PROP_LV_DISPSIZE)
 
 static MENU_UPDATE_FUNC(crop_update)
 {
-    if (CROP_PRESET_MENU && lv)
+    if (RECORDING && CROP_PRESET_SELECTED != CROP_PRESET_MENU)
     {
-        if (CROP_PRESET_MENU == CROP_PRESET_CENTER_Z || CROP_PRESET_MENU ==  CROP_PRESET_33K)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Locked while recording; the new preset will be applied after you stop.");
+        return;
+    }
+
+    if (CROP_PRESET_SELECTED && lv)
+    {
+        if (CROP_PRESET_SELECTED == CROP_PRESET_CENTER_Z || CROP_PRESET_SELECTED ==  CROP_PRESET_33K)
         {
             if (lv_dispsize == 1)
             {
                 MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "To use this mode, exit ML menu & press the zoom button (set to x5/x10).");
+            }
+            else if (CROP_PRESET_SELECTED == CROP_PRESET_CENTER_Z && (video_mode_fps == 30 || video_mode_fps == 60))
+            {
+                /* the sensor can't read the taller 3.5K frame within a 30p frame period */
+                MENU_SET_WARNING(MENU_WARN_INFO, "30/60p: height limited to Canon's x5 readout. Use 24p or 25p for full 3.5K height.");
             }
         }
         else /* non-zoom modes */
@@ -2276,11 +2317,11 @@ static MENU_UPDATE_FUNC(crop_update)
             }
             else if (!is_720p())
             {
-                if (CROP_PRESET_MENU == CROP_PRESET_3x3_1X ||
-                    CROP_PRESET_MENU == CROP_PRESET_3x3_1X_50p ||
-                    CROP_PRESET_MENU == CROP_PRESET_3x3_1X_60p ||
-                    CROP_PRESET_MENU == CROP_PRESET_3x3_1X_45p ||
-                    CROP_PRESET_MENU == CROP_PRESET_3x3_1X_48p)
+                if (CROP_PRESET_SELECTED == CROP_PRESET_3x3_1X ||
+                    CROP_PRESET_SELECTED == CROP_PRESET_3x3_1X_50p ||
+                    CROP_PRESET_SELECTED == CROP_PRESET_3x3_1X_60p ||
+                    CROP_PRESET_SELECTED == CROP_PRESET_3x3_1X_45p ||
+                    CROP_PRESET_SELECTED == CROP_PRESET_3x3_1X_48p)
                 {
                     /* these presets only have effect in 720p mode */
                     MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "This preset only works in the 720p 50/60 fps modes from Canon menu.");
@@ -2288,6 +2329,15 @@ static MENU_UPDATE_FUNC(crop_update)
                 }
             }
         }
+    }
+}
+
+/* for settings that are frozen while recording (see crop_rec_sync_settings) */
+static MENU_UPDATE_FUNC(crop_locked_update)
+{
+    if (RECORDING)
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Locked while recording; changes will be applied after you stop.");
     }
 }
 
@@ -2300,13 +2350,14 @@ static struct menu_entry crop_rec_menu[] =
 {
     {
         .name       = "Presets",
-        .priv       = &crop_preset_index,
+        .priv       = &crop_preset_index_cfg,
         .update     = crop_update,
         .depends_on = DEP_LIVEVIEW,
         .children =  (struct menu_entry[]) {
             {
                 .name   = "set 25fps",
-                .priv   = &set_25fps,
+                .priv   = &set_25fps_cfg,
+                .update = crop_locked_update,
                 .max    = 1,
                 .choices = CHOICES("OFF", "ON"),
                 .help   = "OFF = default 24fps, ON = 25fps (anamorphic)",
@@ -2321,7 +2372,8 @@ static struct menu_entry crop_rec_menu[] =
             },
             {
                 .name   = "x3crop",
-                .priv   = &x3crop,
+                .priv   = &x3crop_cfg,
+                .update = crop_locked_update,
                 .max    = 1,
                 .choices = CHOICES("OFF", "ON"),
                 .help   = "Turns 45/48/50/60 fps into x3 crop modes)",
@@ -2778,7 +2830,8 @@ static struct menu_entry bitdepth_menu[] =
 {
     {
     .name   = "Bitdepth",
-    .priv   = &bitdepth,
+    .priv   = &bitdepth_cfg,
+    .update = crop_locked_update,
     .max    = 4,
     .choices = CHOICES("OFF", "8 bit", "9 bit", "10 bit", "12 bit"),
     .help   = "Alter bitdepth\n",
@@ -2790,11 +2843,12 @@ static struct menu_entry bitdepth_menu[] =
     {
         {
         .name   = "Ratio",
-        .priv   = &ratios,
+        .priv   = &ratios_cfg,
+        .update = crop_locked_update,
         .max    = 3,
         .choices = CHOICES("OFF", "2.39:1", "2.35:1", "16:9"),
-        .help       = "Access three global ratios",
-        .help2   = "only anamorphic preset\n"
+        .help       = "Sets the RAW video aspect ratio for all presets (OFF = leave it alone)",
+        .help2   = "anamorphic preset: also adjusts the sensor readout for the ratio."
         },
     };
 
@@ -2856,11 +2910,74 @@ static unsigned int crop_rec_keypress_cbr(unsigned int key)
 }
 
 
-static int crop_rec_needs_lv_refresh()
+/* copy the menu selections into the active settings used by the hooks */
+/* these are frozen while recording, so the sensor setup can't change in the middle of a clip */
+static void crop_rec_sync_settings()
+{
+    static int lock_notified = 0;
+
+    int pending =
+        crop_preset_index != crop_preset_index_cfg ||
+        bitdepth  != bitdepth_cfg  ||
+        ratios    != ratios_cfg    ||
+        x3crop    != x3crop_cfg    ||
+        set_25fps != set_25fps_cfg ;
+
+    if (RECORDING)
+    {
+        if (pending && !lock_notified)
+        {
+            NotifyBox(3000, "crop_rec: settings locked while recording");
+            lock_notified = 1;
+        }
+        return;
+    }
+
+    lock_notified = 0;
+    crop_preset_index = crop_preset_index_cfg;
+    bitdepth  = bitdepth_cfg;
+    ratios    = ratios_cfg;
+    x3crop    = x3crop_cfg;
+    set_25fps = set_25fps_cfg;
+}
+
+/* checksum of all settings used by the CMOS/ADTG/ENGIO overrides */
+/* Canon firmware only writes these registers when LiveView is reconfigured,
+ * so a change in any of them requires a LiveView refresh */
+static uint32_t crop_rec_settings_signature()
+{
+    int * settings[] = {
+        &crop_preset_index, &bitdepth, &ratios, &x3crop, &set_25fps,
+        &shutter_range, &isoauto, &isoaverage,
+        (int *) &reg_713c, (int *) &reg_7150, (int *) &reg_6014, (int *) &reg_6008,
+        (int *) &reg_800c, (int *) &reg_8000, (int *) &reg_8183, (int *) &reg_8184,
+        (int *) &reg_timing1, (int *) &reg_timing2, (int *) &reg_timing3,
+        (int *) &reg_timing4, (int *) &reg_timing5, (int *) &reg_timing6,
+        (int *) &reg_6824, (int *) &reg_6800_height, (int *) &reg_6800_width,
+        (int *) &reg_6804_height, (int *) &reg_6804_width,
+        (int *) &reg_83d4, (int *) &reg_83dc, (int *) &reg_8024,
+        (int *) &cmos1_lo, (int *) &cmos1_hi,
+        (int *) &cmos1, (int *) &cmos2, (int *) &cmos3, (int *) &cmos4, (int *) &cmos5,
+        (int *) &cmos6, (int *) &cmos7, (int *) &cmos8, (int *) &cmos9,
+        (int *) &reg_skip_left, (int *) &reg_skip_right,
+        (int *) &reg_skip_top, (int *) &reg_skip_bottom,
+        (int *) &reg_bl, (int *) &reg_gain,
+    };
+
+    uint32_t sig = 0;
+    for (int i = 0; i < COUNT(settings); i++)
+    {
+        sig = sig * 31 + (uint32_t) *settings[i];
+    }
+    return sig;
+}
+
+/* things to do after closing the ML menu, before checking for a LiveView refresh */
+static void crop_rec_apply_menu_changes()
 {
     if (!lv)
     {
-        return 0;
+        return;
     }
     
     if (ratios == 1) menu_set_str_value_from_script("RAW video", "Aspect ratio", "2.39:1", 5);
@@ -2868,7 +2985,7 @@ static int crop_rec_needs_lv_refresh()
     if (ratios == 3) menu_set_str_value_from_script("RAW video", "Aspect ratio", "16:9", 10);
     
     /* We don´t want this when in photo mode I assume */
-    if (!is_movie_mode()) return 0;
+    if (!is_movie_mode()) return;
     
     /* let´s automate liveview start off setting */
     if (CROP_PRESET_MENU == CROP_PRESET_CENTER_Z || CROP_PRESET_MENU ==  CROP_PRESET_33K)
@@ -2879,12 +2996,24 @@ static int crop_rec_needs_lv_refresh()
         gui_uilock(UILOCK_NONE);
         info_led_off();
     }
+}
+
+static int crop_rec_needs_lv_refresh(int settings_changed)
+{
+    if (!lv)
+    {
+        return 0;
+    }
+    
+    /* We don´t want this when in photo mode I assume */
+    if (!is_movie_mode()) return 0;
     
     if (CROP_PRESET_MENU)
     {
         if (is_supported_mode())
         {
-            if (!patch_active || CROP_PRESET_MENU != crop_preset || is_5D3)
+            /* 5D3: other settings than the preset are only applied on refresh, too */
+            if (!patch_active || CROP_PRESET_MENU != crop_preset || (is_5D3 && settings_changed))
             {
                 return 1;
             }
@@ -3000,11 +3129,13 @@ static void iso()
 /* when closing ML menu, check whether we need to refresh the LiveView */
 static unsigned int crop_rec_polling_cbr(unsigned int unused)
 {
-    if (CROP_PRESET_MENU == CROP_PRESET_OFF && bitdepth && !gui_menu_shown())
+    if (CROP_PRESET_SELECTED == CROP_PRESET_OFF && bitdepth_cfg && !gui_menu_shown() && !RECORDING)
     {
-        bitdepth = 0;
+        bitdepth_cfg = 0;
         NotifyBox(3000, "Movie tab bitdepth reset when crop rec OFF");
     }
+    
+    crop_rec_sync_settings();
     
     
     /* refresh canon menu iso while not recording. Caveat. Flicker but better than nothong */
@@ -3018,9 +3149,11 @@ if (CROP_PRESET_MENU == CROP_PRESET_1x3 || CROP_PRESET_MENU == CROP_PRESET_anamo
 {
     int fpz = fps_get_current_x1000();
     
-    if (fpz == 0x6b09 && CROP_PRESET_MENU == CROP_PRESET_1x3)
+    /* stuck state: our timer A, with timer B left at Canon's 24p default (2275) */
+    /* 27.401 fps with timer A = 385 (23.976p), 27.472 fps with timer A = 384 (25p) */
+    if (CROP_PRESET_MENU == CROP_PRESET_1x3 && fpz == (set_25fps ? 27472 : 0x6b09))
     {
-        EngDrvOutLV(0xC0F06014, 0xa27);
+        EngDrvOutLV(0xC0F06014, set_25fps ? 0x9c3 : 0xa27);
     }
     
     if (fpz == 0x6b09 && CROP_PRESET_MENU == CROP_PRESET_anamorph_fullres)
@@ -3093,13 +3226,20 @@ if (CROP_PRESET_MENU == CROP_PRESET_1x3 || CROP_PRESET_MENU == CROP_PRESET_anamo
     
     if (lv_dirty)
     {
+        /* settings from the last LiveView refresh; 0 = force a check at startup */
+        static uint32_t applied_settings = 0;
+        uint32_t current_settings = crop_rec_settings_signature();
+        int settings_changed = (current_settings != applied_settings);
+
+        crop_rec_apply_menu_changes();
+
         /* do we need to refresh LiveView? */
-        if (crop_rec_needs_lv_refresh())
+        if (crop_rec_needs_lv_refresh(settings_changed))
         {
             /* let's check this once again, just in case */
             /* (possible race condition that would result in unnecessary refresh) */
             msleep(500);
-            if (crop_rec_needs_lv_refresh())
+            if (crop_rec_needs_lv_refresh(settings_changed))
             {
                 info_led_on();
                 gui_uilock(UILOCK_EVERYTHING);
@@ -3110,6 +3250,7 @@ if (CROP_PRESET_MENU == CROP_PRESET_1x3 || CROP_PRESET_MENU == CROP_PRESET_anamo
                 info_led_off();
             }
         }
+        applied_settings = current_settings;
         lv_dirty = 0;
     }
     
@@ -3136,8 +3277,9 @@ if (CROP_PRESET_MENU == CROP_PRESET_1x3 || CROP_PRESET_MENU == CROP_PRESET_anamo
           crop_preset == CROP_PRESET_3x3_1X_45p) && patch) && lv_dispsize == 1)
     {
         patch = 0;
-        patch_active = 0;
-        
+        /* note: hooks stay installed; clearing patch_active here (without unpatching)
+         * only made update_patch() fail with ALREADY_PATCHED */
+
         info_led_on();
         gui_uilock(UILOCK_EVERYTHING);
         int old_zoom = lv_dispsize;
@@ -3360,6 +3502,24 @@ static unsigned int raw_info_update_cbr(unsigned int unused)
                 break;
         }
         
+        /* x3crop turns the 3x3 presets into 1:1 readouts (720p only, see cmos_hook/adtg_hook) */
+        if ((x3crop || crop_patch) && is_720p())
+        {
+            switch (crop_preset)
+            {
+                case CROP_PRESET_3x3_1X:
+                case CROP_PRESET_3x3_1X_50p:
+                case CROP_PRESET_3x3_1X_60p:
+                case CROP_PRESET_3x3_1X_48p:
+                case CROP_PRESET_3x3_1X_45p:
+                    raw_capture_info.binning_x    = raw_capture_info.binning_y  = 1;
+                    raw_capture_info.skipping_x   = raw_capture_info.skipping_y = 0;
+                    break;
+                default:
+                    break;
+            }
+        }
+
         if (is_5D3)
         {
             /* update skip offsets */
@@ -3395,6 +3555,9 @@ static unsigned int crop_rec_init()
         crop_rec_menu[0].max        = COUNT(crop_choices_5d3) - 1;
         crop_rec_menu[0].help       = crop_choices_help_5d3;
         crop_rec_menu[0].help2      = crop_choices_help2_5d3;
+        
+        /* active settings start from the saved config */
+        crop_rec_sync_settings();
         
         fps_main_clock = 24000000;
         /* 24p,  25p,  30p,  50p,  60p,   x5 */
@@ -3463,12 +3626,12 @@ MODULE_DEINIT(crop_rec_deinit)
 MODULE_INFO_END()
 
 MODULE_CONFIGS_START()
-MODULE_CONFIG(crop_preset_index)
+MODULE_CONFIG(crop_preset_index_cfg)
 MODULE_CONFIG(shutter_range)
-MODULE_CONFIG(bitdepth)
-MODULE_CONFIG(ratios)
-MODULE_CONFIG(x3crop)
-MODULE_CONFIG(set_25fps)
+MODULE_CONFIG(bitdepth_cfg)
+MODULE_CONFIG(ratios_cfg)
+MODULE_CONFIG(x3crop_cfg)
+MODULE_CONFIG(set_25fps_cfg)
 MODULE_CONFIG(framestop)
 MODULE_CONFIG(frameburst)
 MODULE_CONFIG(isoaverage)
