@@ -26,3 +26,6 @@ platform/*/version.bin
 
 # the Mercurial store is tracked in this repo; don't let the patterns above hide its *.d files
 !.hg/**
+
+# Docker builds (build_tools/docker/build.sh)
+build/

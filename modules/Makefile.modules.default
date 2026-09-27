@@ -12,3 +12,4 @@ ML_MODULES ?= \
 	bench \
 	sd_uhs \
 	adtg_gui \
+	raw_twk \
