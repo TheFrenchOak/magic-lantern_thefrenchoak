@@ -2828,12 +2828,32 @@ static CONFIG_INT("anamorphic.preview", anamorphic_preview, 0);
 
 #ifndef FEATURE_ANAMORPHIC_PREVIEW
 #define anamorphic_preview 0
+#define anamorphic_preview_active() 0
 #endif
 
 #ifdef FEATURE_ANAMORPHIC_PREVIEW
 
 static int anamorphic_ratio_num[10] = {5, 4, 7, 3, 5, 9, 2, 3};
 static int anamorphic_ratio_den[10] = {4, 3, 5, 2, 3, 5, 1, 1};
+
+/* extra vertical squeeze requested by raw video (x1000, 0 = none): Canon's LiveView shows the
+ * 1x3 binning modes (crop_rec anamorphic) stretched vertically; this puts them back to the right
+ * proportions, in real time; it combines with the lens squeeze selected in the menu */
+static volatile int anamorphic_force_x1000 = 0;
+
+/* when the squeeze filter last ran (it doesn't when e.g. mlv_lite shows its own preview) */
+static volatile int anamorphic_last_run = 0;
+
+void anamorphic_preview_force(int squeeze_x1000)
+{
+    /* squeeze only (x1 ... x4): smaller factors would stretch the image beyond the screen */
+    anamorphic_force_x1000 = (squeeze_x1000 >= 1000) ? MIN(squeeze_x1000, 4000) : 0;
+}
+
+static int anamorphic_preview_active()
+{
+    return anamorphic_preview || anamorphic_force_x1000;
+}
 
 /* squeeze factor of the anamorphic lens (x1000; 1000 = OFF) */
 /* for raw video previews (mlv_lite), which replace the LiveView image and bypass our display filter */
@@ -2870,20 +2890,29 @@ static MENU_UPDATE_FUNC(anamorphic_preview_display)
 static int16_t anamorphic_bmp_y_lut[480];
 int FAST anamorphic_squeeze_bmp_y(int y)
 {
-    if (likely(!anamorphic_preview)) return y;
+    if (likely(!anamorphic_preview_active())) return y;
     if (unlikely(!lv)) return y;
     if (unlikely(hdmi_code >= 5)) return y;
     if (unlikely(y < 0 || y >= 480)) return y;
 
+    /* same squeeze as anamorphic_squeeze: lens (menu) times raw video (forced) */
     static int prev_idx = -1;
-    if (unlikely(prev_idx != (int)anamorphic_ratio_idx)) // update the LUT
+    static int prev_force = -1;
+    int force = anamorphic_force_x1000;
+    if (unlikely(prev_idx != (int)anamorphic_ratio_idx || prev_force != force)) // update the LUT
     {
-        int num = anamorphic_ratio_num[anamorphic_ratio_idx];
-        int den = anamorphic_ratio_den[anamorphic_ratio_idx];
+        int num = anamorphic_preview ? anamorphic_ratio_num[anamorphic_ratio_idx] : 1;
+        int den = anamorphic_preview ? anamorphic_ratio_den[anamorphic_ratio_idx] : 1;
+        if (force)
+        {
+            num *= force;
+            den *= 1000;
+        }
         int yc = os.y0 + os.y_ex / 2;
         for (int y = 0; y < 480; y++)
-            anamorphic_bmp_y_lut[y] = (y - yc) * den/num + yc;
+            anamorphic_bmp_y_lut[y] = COERCE((y - yc) * den/num + yc, 0, 479);   /* stay on screen */
         prev_idx = anamorphic_ratio_idx;
+        prev_force = force;
     }
     return anamorphic_bmp_y_lut[y];
 }
@@ -2904,13 +2933,20 @@ static void yuvcpy_dark(uint32_t* dst, uint32_t* src, size_t n, int parity)
 
 static void FAST anamorphic_squeeze()
 {
-    if (!anamorphic_preview) return;
+    if (!anamorphic_preview_active()) return;
     if (!get_global_draw()) return;
     if (!lv) return;
     if (hdmi_code >= 5) return;
     
-    int num = anamorphic_ratio_num[anamorphic_ratio_idx];
-    int den = anamorphic_ratio_den[anamorphic_ratio_idx];
+    /* lens squeeze from the menu, times the squeeze requested by raw video */
+    int num = anamorphic_preview ? anamorphic_ratio_num[anamorphic_ratio_idx] : 1;
+    int den = anamorphic_preview ? anamorphic_ratio_den[anamorphic_ratio_idx] : 1;
+    int force = anamorphic_force_x1000;
+    if (force)
+    {
+        num *= force;
+        den *= 1000;
+    }
 
     uint32_t* src_buf;
     uint32_t* dst_buf;
@@ -2938,7 +2974,35 @@ static void FAST anamorphic_squeeze()
         else
             memset(&dst_buf[LV(0,y)/4], 0, 720*2);
     }
+
+    anamorphic_last_run = get_ms_clock();
 }
+
+/* for raw overlays (RAW zebras, RAW false color), which are drawn in screen coordinates:
+ * the screen row y shows this row of the original LiveView image while the squeeze filter
+ * is running; -1 = black bar (nothing to draw) */
+int anamorphic_source_bmp_y(int y)
+{
+    if (!anamorphic_preview_active()) return y;
+    if (get_ms_clock() - anamorphic_last_run > 500) return y;   /* filter not running */
+
+    int num = anamorphic_preview ? anamorphic_ratio_num[anamorphic_ratio_idx] : 1;
+    int den = anamorphic_preview ? anamorphic_ratio_den[anamorphic_ratio_idx] : 1;
+    int force = anamorphic_force_x1000;
+    if (force)
+    {
+        num *= force;
+        den *= 1000;
+    }
+
+    int ym = os.y0 + os.y_ex/2;
+    int ya = (y - ym) * num/den + ym;
+    return (ya > os.y0 && ya < os.y_max) ? ya : -1;
+}
+#endif
+
+#ifndef FEATURE_ANAMORPHIC_PREVIEW
+int anamorphic_source_bmp_y(int y) { return y; }
 #endif
 
 #ifdef FEATURE_DEFISHING_PREVIEW
@@ -3230,7 +3294,7 @@ int display_filter_enabled()
     #endif
     
     int fp = focus_peaking_as_display_filter();
-    if (!(defish_preview || anamorphic_preview || fp || mdf)) return 0;
+    if (!(defish_preview || anamorphic_preview_active() || fp || mdf)) return 0;
     if (!zebra_should_run()) return 0;
     if (should_draw_zoom_overlay()) return 0; // not enough CPU power to run MZ and filters at the same time
     
@@ -3375,7 +3439,7 @@ void display_filter_step(int k)
     #endif
     
     #ifdef FEATURE_ANAMORPHIC_PREVIEW
-    if (anamorphic_preview)
+    if (anamorphic_preview_active())
     {
         if (k % 1 == 0)
             BMP_LOCK( if (lv) anamorphic_squeeze(); )

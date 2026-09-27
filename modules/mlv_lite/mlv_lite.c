@@ -126,6 +126,20 @@ static int should_restart_recording = 0;
 
 /* from tweaks.c (Display > Anamorphic); 0 if not available */
 extern WEAK_FUNC(ret_0) int get_anamorphic_preview_squeeze_x1000();
+extern WEAK_FUNC(ret_0) void anamorphic_preview_force(int squeeze_x1000);
+
+/* Canon's real-time LiveView shows the 1x3 binning modes (crop_rec anamorphic, FF HQ) stretched
+ * vertically, and only the central part of the frame (it reads the lines as in its own video mode);
+ * the anamorphic display filter from tweaks.c puts it back to the right proportions: a wide band,
+ * useful for focus / movement, while our framing preview shows the whole frame */
+/* 0 = OFF, 1 = auto (computed from the raw size), then fixed factors (x100) for calibration */
+static CONFIG_INT("raw.canon_desqueeze", canon_desqueeze, 1);
+#define CANON_DESQUEEZE_OFF  0
+#define CANON_DESQUEEZE_AUTO 1
+static const int canon_desqueeze_x100[] = { 0, 0, 125, 133, 140, 150, 160, 164, 170, 180, 200, 220, 240, 250, 275, 300, 325, 350 };
+#define CANON_DESQUEEZE_CHOICES "OFF", "Auto", "x1.25", "x1.33", "x1.40", "x1.50", "x1.60", "x1.64", "x1.70", "x1.80", \
+                                "x2.00", "x2.20", "x2.40", "x2.50", "x2.75", "x3.00", "x3.25", "x3.50"
+static int canon_view_squeeze_auto_x1000();
 
 /* set when recording stops without being asked to, so the user is told why */
 static volatile int unexpected_stop = 0;
@@ -1367,6 +1381,26 @@ static MENU_UPDATE_FUNC(file_naming_update)
     }
 }
 
+static MENU_UPDATE_FUNC(canon_desqueeze_update)
+{
+    if (canon_desqueeze == CANON_DESQUEEZE_OFF)
+    {
+        return;
+    }
+
+    int auto_x1000 = canon_view_squeeze_auto_x1000();
+    if (!auto_x1000)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "Only for 1x3 binning modes (crop_rec anamorphic, Cine preset FF HQ).");
+        return;
+    }
+
+    if (canon_desqueeze == CANON_DESQUEEZE_AUTO)
+    {
+        MENU_SET_VALUE("Auto (x%d.%02d)", auto_x1000 / 1000, (auto_x1000 % 1000) / 10);
+    }
+}
+
 static MENU_UPDATE_FUNC(preview_mode_update)
 {
     if (prevmode)
@@ -2084,10 +2118,41 @@ void show_recording_status()
     }
 }
 
+/* vertical squeeze (x1000) for Canon's LiveView in 1x3 binning modes, 0 = not needed */
+static int canon_view_squeeze_auto_x1000()
+{
+    int bx = raw_capture_info.binning_x + raw_capture_info.skipping_x;
+    int by = raw_capture_info.binning_y + raw_capture_info.skipping_y;
+    if (bx != 3 || by != 1) return 0;
+
+    /* tested on 5D3 (FF HQ): the binning ratio (x3) gives round objects */
+    return bx * 1000 / by;
+}
+
+static void update_canon_view_desqueeze()
+{
+    int squeeze = 0;
+
+    int choice = COERCE(canon_desqueeze, 0, COUNT(canon_desqueeze_x100) - 1);
+    if (choice != CANON_DESQUEEZE_OFF && raw_video_enabled && lv && is_movie_mode() && lv_dispsize == 1)
+    {
+        int auto_x1000 = canon_view_squeeze_auto_x1000();
+        if (auto_x1000)
+        {
+            squeeze = (choice == CANON_DESQUEEZE_AUTO) ? auto_x1000 : canon_desqueeze_x100[choice] * 10;
+        }
+    }
+
+    /* only used while Canon's LiveView is on screen (our framing preview replaces it otherwise) */
+    anamorphic_preview_force(squeeze);
+}
+
 static REQUIRES(ShootTask) EXCLUDES(settings_sem)
 unsigned int raw_rec_polling_cbr(unsigned int unused)
 {
     if (!compress_mq) return 0;
+
+    update_canon_view_desqueeze();
 
     /* Cine presets: have the settings changed since the preset was applied? */
     static int cine_aux = INT_MIN;
@@ -4311,6 +4376,15 @@ static struct menu_entry raw_video_menu[] =
                          "Auto; color preview while recording, gray only if the buffer fills up.\n",
             },
             {
+                .name = "Canon view desqueeze",
+                .priv = &canon_desqueeze,
+                .max = COUNT(canon_desqueeze_x100) - 1,
+                .choices = CHOICES(CANON_DESQUEEZE_CHOICES),
+                .update = canon_desqueeze_update,
+                .help  = "1x3 modes (FF HQ): Canon's real-time view with the right proportions.",
+                .help2 = "It only shows the central band of the frame; the framing preview shows it all.",
+            },
+            {
                 .name = "Card Spanning",
                 .priv = &card_spanning,
                 .max = 1,
@@ -4878,7 +4952,7 @@ static const struct cine_preset_def cine_presets[] = {
         .spanning           = 1,
         .resolution         = 11,                       /* max width */
         .aspect             = 17,                       /* 1:2 = max height */
-        .crop_rec_preview   = PREVMODE_AUTO_GRAY_REC,
+        .crop_rec_preview   = PREVMODE_AUTO_GRAY_REC,  /* whole frame; long half-shutter = real-time central band */
         .preview            = 2,
         .zoom               = 1,
     },
@@ -4938,6 +5012,7 @@ static void cine_preset_update_state()
     if (prevmode != p->crop_rec_preview) return;
     if (!prevmode && preview_mode != p->preview) return;
     if (pre_record || rec_trigger || h264_proxy_menu || kill_gd || dolly_mode) return;
+    if (!canon_desqueeze) return;
 
     /* crop_rec: active sensor mode, and the other settings as selected in its menu */
     if (crop_preset_index != cine_crop_index || bitdepth != cine_bitdepth) return;
@@ -5083,6 +5158,7 @@ static void cine_preset_apply(int id)
     dolly_mode          = 0;
     prevmode            = p->crop_rec_preview;
     preview_mode        = p->preview;
+    if (canon_desqueeze == CANON_DESQUEEZE_OFF) canon_desqueeze = CANON_DESQUEEZE_AUTO;   /* keep a calibrated factor */
 
     /* sound (mlv_snd), 48 kHz */
     menu_set_value_from_script("Sound recording", "Enable sound", 1);
@@ -5235,7 +5311,7 @@ static struct menu_entry cine_preset_menu[] =
                 .update     = cine_preset_entry_update,
                 .icon_type  = IT_ACTION,
                 .help       = "5.7K 1x3 full frame, 14-bit lossless, CF+SD. Main mode, best overall.",
-                .help2      = "1920x2340 raw, desqueeze x3 in post (5760x2340, 2.46:1). 10-bit without SD.",
+                .help2      = "Exact framing preview; long half-shutter = real-time central band. 10-bit without SD.",
             },
             {
                 .name       = "S35 HQ",
@@ -5412,6 +5488,7 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(cine_crop_index)
     MODULE_CONFIG(cine_spanning)
     MODULE_CONFIG(cine_bitdepth)
+    MODULE_CONFIG(canon_desqueeze)
     MODULE_CONFIG(pref_card)
     MODULE_CONFIG(raw_video_enabled)
     MODULE_CONFIG(resolution_index_x)

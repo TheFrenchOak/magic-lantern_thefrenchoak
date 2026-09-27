@@ -6,6 +6,10 @@
 #include "zebra.h"
 #include "imgconv.h"
 #include "greenscreen.h"
+#include "raw.h"
+
+/* falsecolor.h can't be included here (its false_colour declaration doesn't match); keep in sync */
+#define FALSECOLOR_PALETTE_RAW 6
 
 CONFIG_INT( "falsecolor.draw", falsecolor_draw, 0);
 CONFIG_INT( "falsecolor.palette", falsecolor_palette, 0);
@@ -19,6 +23,13 @@ uint8_t false_colour[][256] = {
     {0x26, 0x26, 0x26, 0x27, 0x27, 0x28, 0x28, 0x28, 0x29, 0x29, 0x2A, 0x2A, 0x2B, 0x2B, 0x2B, 0x2C, 0x2C, 0x2D, 0x2D, 0x2D, 0x2E, 0x2E, 0x2F, 0x2F, 0x30, 0x30, 0x30, 0x31, 0x31, 0x32, 0x32, 0x33, 0x33, 0x33, 0x34, 0x34, 0x35, 0x35, 0x35, 0x36, 0x36, 0x37, 0x37, 0x38, 0x38, 0x38, 0x39, 0x39, 0x3A, 0x3A, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x3A, 0x3A, 0x3B, 0x3B, 0x3C, 0x3C, 0x3D, 0x3D, 0x3D, 0x3E, 0x3E, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x41, 0x41, 0x42, 0x42, 0x42, 0x43, 0x43, 0x44, 0x44, 0x44, 0x45, 0x45, 0x46, 0x46, 0x47, 0x47, 0x47, 0x48, 0x48, 0x49, 0x49, 0x49, 0x4A, 0x4A, 0x4B, 0x4B, 0x4C, 0x4C, 0x4C, 0x4D, 0x4D, 0x4E, 0x4E, 0x4F},
 };
 
+
+/* palette used for YUV-based drawing (histogram...): Marshall when RAW stops is selected */
+static int falsecolor_yuv_palette()
+{
+    return falsecolor_palette == FALSECOLOR_PALETTE_RAW ? 0 : falsecolor_palette;
+}
+
 int falsecolor_value_ex(int palette, int i)
 {
   return false_colour[palette][i];
@@ -26,19 +37,133 @@ int falsecolor_value_ex(int palette, int i)
 
 int falsecolor_value(int i)
 {
-  return false_colour[falsecolor_palette][i];
+  return false_colour[falsecolor_yuv_palette()][i];
 }
 
 int falsecolor_fordraw(int i)
 {
-  return falsecolor_draw ? false_colour[falsecolor_palette][i] : COLOR_WHITE;
+  return falsecolor_draw ? false_colour[falsecolor_yuv_palette()][i] : COLOR_WHITE;
 }
 
 extern uint8_t* get_bvram_mirror();
 
 #ifdef FEATURE_FALSE_COLOR
+
+/* RAW stops: exposure measured on the raw data, in stops below clipping
+ * (what you get in post, unlike the LiveView image, which is a processed preview):
+ *   red     clipped (any channel)
+ *   yellow  last 1/2 stop below clipping
+ *   orange  2.5 stops below clipping (+-1/4): bright skin, one stop over middle gray
+ *   green   3.5 stops below clipping (+-1/4): middle gray (18%) for a usual RAW exposure
+ *   blue    less than 2 stops above the noise floor: deep shadows, visible noise
+ *   magenta at the noise floor: no usable detail
+ * other levels are left transparent, so the image stays visible */
+#define RAW_FC_YELLOW_EV        -0.5f
+#define RAW_FC_SKIN_EV          -2.5f
+#define RAW_FC_GRAY_EV          -3.5f
+#define RAW_FC_BAND_EV           0.25f  /* half width of the skin and gray bands */
+#define RAW_FC_BLUE_EV           2.0f   /* above the noise floor */
+#define RAW_FC_MAGENTA_EV        0.5f   /* above the noise floor */
+
+/* legend / menu preview: color for a level in stops below clipping */
+static int raw_false_color_for_ev(float ev, float noise_floor)
+{
+    if (ev >= 0)                                    return COLOR_RED;
+    if (ev >= RAW_FC_YELLOW_EV)                     return COLOR_YELLOW;
+    if (ABS(ev - RAW_FC_SKIN_EV) <= RAW_FC_BAND_EV) return COLOR_ORANGE;
+    if (ABS(ev - RAW_FC_GRAY_EV) <= RAW_FC_BAND_EV) return COLOR_GREEN2;
+    if (ev <= noise_floor + RAW_FC_MAGENTA_EV)      return COLOR_MAGENTA;
+    if (ev <= noise_floor + RAW_FC_BLUE_EV)         return COLOR_BLUE;
+    return 0;
+}
+
+static void draw_false_raw_lv()
+{
+    if (!raw_update_params()) return;
+
+    uint8_t * const bvram = bmp_vram_real();
+    if (!bvram) return;
+    uint8_t * const bvram_mirror = get_bvram_mirror();
+    if (!bvram_mirror) return;
+
+    /* thresholds in raw units (same as RAW zebras for clipping) */
+    int white = raw_info.white_level;
+    if (white > 16383) white = 15000;
+    float noise_floor = -raw_info.dynamic_range / 100.0f;
+    int yellow  = ev_to_raw(RAW_FC_YELLOW_EV);
+    int skin_lo = ev_to_raw(RAW_FC_SKIN_EV - RAW_FC_BAND_EV);
+    int skin_hi = ev_to_raw(RAW_FC_SKIN_EV + RAW_FC_BAND_EV);
+    int gray_lo = ev_to_raw(RAW_FC_GRAY_EV - RAW_FC_BAND_EV);
+    int gray_hi = ev_to_raw(RAW_FC_GRAY_EV + RAW_FC_BAND_EV);
+    int blue    = ev_to_raw(noise_floor + RAW_FC_BLUE_EV);
+    int magenta = ev_to_raw(noise_floor + RAW_FC_MAGENTA_EV);
+
+    /* 4x2 screen pixels per sample; 8x2 while recording, to leave CPU for the recorder */
+    int step = RECORDING ? 8 : 4;
+
+    int off = get_y_skip_offset_for_overlays();
+    for (int i = os.y0 + off; i < os.y_max - off; i += 2)
+    {
+        /* the anamorphic filter (lens or 1x3 desqueeze) may show another LiveView row here */
+        int src_i = anamorphic_source_bmp_y(i);
+        int y = (src_i >= 0) ? BM2RAW_Y(src_i) : -1;
+
+        uint32_t * const b_row = (uint32_t*)( bvram        + BM_R(i) );  /* 4 pixels */
+        uint32_t * const m_row = (uint32_t*)( bvram_mirror + BM_R(i) );
+
+        int row_ok = (y >= raw_info.active_area.y1 && y <= raw_info.active_area.y2);
+
+        for (int j = os.x0; j < os.x_max; j += step)
+        {
+            int x = BM2RAW_X(j);
+
+            /* outside the image (black bars): transparent, to clean up our old pixels */
+            int c = 0;
+            if (row_ok && x >= raw_info.active_area.x1 && x <= raw_info.active_area.x2)
+            {
+                /* for dual ISO: dark lines, as for RAW zebras */
+                int r = raw_red_pixel_dark(x, y);
+                int g = raw_green_pixel_dark(x, y);
+                int b = raw_blue_pixel_dark(x, y);
+
+                c =
+                    (r > white || g > white || b > white)  ? COLOR_RED     :
+                    (g >= yellow)                           ? COLOR_YELLOW  :
+                    (g >= skin_lo && g <= skin_hi)          ? COLOR_ORANGE  :
+                    (g >= gray_lo && g <= gray_hi)          ? COLOR_GREEN2  :
+                    (g <= magenta)                          ? COLOR_MAGENTA :
+                    (g <= blue)                             ? COLOR_BLUE    :
+                                                              0             ;
+            }
+            uint32_t c4 = c | (c << 8) | (c << 16) | (c << 24);
+
+            for (int k = 0; k < step; k += 4)
+            {
+                uint32_t * bp = b_row + (j + k) / 4;
+                uint32_t * mp = m_row + (j + k) / 4;
+
+                /* don't draw over menus / other overlays; clean up our old pixels */
+                if (*bp != 0 && *bp != *mp) { little_cleanup(bp, mp); continue; }
+                if (*mp & 0x80808080) continue;
+
+                *mp = *bp = c4;
+            }
+        }
+    }
+}
+
 void draw_false_downsampled( void )
 {
+    if (falsecolor_palette == FALSECOLOR_PALETTE_RAW)
+    {
+        /* raw data only in LiveView with RAW video (or RAW photo LiveView), 14-bit */
+        if (lv && can_use_raw_overlays())
+        {
+            draw_false_raw_lv();
+        }
+        return;
+    }
+
     //~ if (vram_lv.width > 720) return;
     if (!PLAY_OR_QR_MODE)
     {
@@ -107,11 +232,27 @@ char* falsecolor_palette_name()
         falsecolor_palette == 2 ? "50-55%" :
         falsecolor_palette == 3 ? "67-72%" :
         falsecolor_palette == 4 ? "Banding detection" :
-        falsecolor_palette == 5 ? "GreenScreen" : "Unk";
+        falsecolor_palette == 5 ? "GreenScreen" :
+        falsecolor_palette == FALSECOLOR_PALETTE_RAW ? "RAW stops" : "Unk";
 }
 
 void falsecolor_palette_preview(int x, int y)
 {
+    if (falsecolor_palette == FALSECOLOR_PALETTE_RAW)
+    {
+        /* 12 stops, from the noise floor (left) to clipping (right); gray = no color */
+        /* last measured dynamic range (from the raw backend), or a typical 5D3 value */
+        float noise_floor = (raw_info.dynamic_range > 500) ? -raw_info.dynamic_range / 100.0f : -11.0f;
+
+        for (int i = 0; i < 256; i++)
+        {
+            float ev = -12.0f + i * 12.5f / 256;
+            int c = raw_false_color_for_ev(ev, noise_floor);
+            draw_line(x + i, y, x + i, y + font_large.height - 2, c ? c : COLOR_GRAY(40));
+        }
+        return;
+    }
+
     for (int i = 0; i < 256; i++)
     {
         draw_line(x + i, y, x + i, y + font_large.height - 2, false_colour[falsecolor_palette][i]);
@@ -134,6 +275,11 @@ MENU_UPDATE_FUNC(falsecolor_display_palette)
         falsecolor_palette_name()
     );
     if (info->can_custom_draw) falsecolor_palette_preview(info->x, info->y + font_large.height + 10);
+
+    if (falsecolor_palette == FALSECOLOR_PALETTE_RAW && !can_use_raw_overlays_menu())
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "RAW stops needs raw data: RAW video on (or RAW photos in LiveView).");
+    }
 }
 
 #endif

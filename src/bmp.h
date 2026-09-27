@@ -572,5 +572,6 @@ uint8_t* get_bvram_mirror();
 /* tweaks.c, for making overlays match anamorphic preview */
 /* todo: remove it and refactor display filters so zebra overlays read directly from filtered buffer */
 extern int anamorphic_squeeze_bmp_y(int y);
+extern int anamorphic_source_bmp_y(int y);  /* screen row -> LiveView row, while the anamorphic filter runs; -1 = black bar */
 
 #endif //#ifndef _bmp_h_

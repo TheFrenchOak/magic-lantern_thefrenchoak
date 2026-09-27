@@ -17,6 +17,9 @@ extern uint8_t *false_colour[256];
 extern int falsecolor_draw;
 extern int falsecolor_palette;
 
+/* not in false_colour[]: computed from the raw data (see draw_false_raw_lv) */
+#define FALSECOLOR_PALETTE_RAW 6
+
 MENU_UPDATE_FUNC(falsecolor_display);
 
 MENU_UPDATE_FUNC(falsecolor_display_palette);

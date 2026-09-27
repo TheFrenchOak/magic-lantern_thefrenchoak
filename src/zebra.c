@@ -814,8 +814,19 @@ static void FAST draw_zebras_raw_lv()
         uint64_t* bp;  // through bmp vram
         uint64_t* mp;  // through mirror
 
-        int y = BM2RAW_Y(i);
-        if (y < raw_info.active_area.y1 || y > raw_info.active_area.y2) continue;
+        /* the anamorphic filter (lens or 1x3 desqueeze) may show another LiveView row here */
+        int src_i = anamorphic_source_bmp_y(i);
+        int y = (src_i >= 0) ? BM2RAW_Y(src_i) : -1;
+        if (y < raw_info.active_area.y1 || y > raw_info.active_area.y2)
+        {
+            /* black bar or outside the image: remove our old zebras from this row */
+            for (int j = os.x0; j < os.x_max; j += 8)
+            {
+                little_cleanup(b_row + j/8, m_row + j/8);
+                little_cleanup((uint8_t*)(b_row + j/8) + 4, (uint8_t*)(m_row + j/8) + 4);
+            }
+            continue;
+        }
         
         for (int j = os.x0; j < os.x_max; j += 8)
         {
@@ -2997,11 +3008,18 @@ struct menu_entry zebra_menus[] = {
             {
                 .name = "Palette      ",
                 .priv = &falsecolor_palette,
-                .max = 5,
+                .max = 6,
                 .icon_type = IT_DICE,
-                .choices = CHOICES("Marshall", "SmallHD", "50-55%", "67-72%", "Banding detection", "GreenScreen"),
+                .choices = CHOICES("Marshall", "SmallHD", "50-55%", "67-72%", "Banding detection", "GreenScreen", "RAW stops"),
                 .update = falsecolor_display_palette,
                 .help = "False color palettes for exposure, banding, green screen...",
+                .help2 = "Marshall monitor palette (from the LiveView image).\n"
+                         "SmallHD monitor palette (from the LiveView image).\n"
+                         "Highlights 50-55% (from the LiveView image).\n"
+                         "Highlights 67-72% (from the LiveView image).\n"
+                         "Banding detection.\n"
+                         "Green screen.\n"
+                         "RAW: red clipped, yellow -1/2 stop, orange skin, green gray, blue/magenta noise.\n",
             },
             MENU_EOL
         }
@@ -4088,6 +4106,9 @@ livev_hipriority_task( void* unused )
             #endif            
             if (hist_draw && RAW_HISTOGRAM_ENABLED) raw_needed = 1;          /* raw hisogram (any kind) */
             if (spotmeter_draw && spotmeter_formula == 3) raw_needed = 1;   /* spotmeter, units: raw */
+            #ifdef FEATURE_FALSE_COLOR
+            if (falsecolor_draw && falsecolor_palette == FALSECOLOR_PALETTE_RAW) raw_needed = 1;   /* RAW false color */
+            #endif
         }
 
         if (!raw_flag && raw_needed)
