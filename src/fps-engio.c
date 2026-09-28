@@ -41,6 +41,7 @@
 #include "raw.h"
 #include "fps.h"
 #include "shoot.h"
+#include "module.h"
 
 
 #define FPS_REGISTER_A 0xC0F06008
@@ -387,6 +388,30 @@ int get_max_shutter_timer()
     return SHUTTER_x1000_TO_TIMER(default_fps);
 }
 
+/* crop_rec: Canon's default timer A for the current mode (its overrides hide it from us); 0 = not active */
+static int (*crop_rec_get_canon_timer_a)() = MODULE_FUNCTION(crop_rec_get_canon_timer_a);
+
+/* shutter timer for a shutter angle at the current frame rate, e.g. 180 degrees:
+ * exposure = angle / 360 of the frame duration, i.e. shutter = 1 / (fps * 360 / angle);
+ * the timer counts Canon's line periods (Canon's default timer A for the video mode), so crop_rec
+ * and FPS override, which keep the absolute shutter time, still give the requested angle */
+int get_shutter_timer_for_angle(int angle)
+{
+    int fps = fps_get_current_x1000();
+    if (fps <= 0 || angle <= 0 || !fps_timer_a_orig)
+    {
+        return 0;
+    }
+
+    /* with crop_rec, the "default" timer register holds crop_rec's value (e.g. 385 instead of 440
+     * in the 1x3 preset), which gave 1/42 (206 degrees) instead of 1/48 */
+    int canon_timer_a = crop_rec_get_canon_timer_a();
+    int tg = (canon_timer_a > 0) ? calc_tg_freq(canon_timer_a) : TG_FREQ_SHUTTER;
+
+    int shutter_r_x1000 = fps * 360 / angle;
+    return (tg + shutter_r_x1000 / 2) / shutter_r_x1000;
+}
+
 /* shutter speed in microseconds, from timer value */
 int get_shutter_speed_us_from_timer(int timer)
 {
@@ -459,6 +484,11 @@ void fps_override_shutter_blanking()
 }
 #endif
 
+#ifdef FRAME_SHUTTER_BLANKING_READ
+/* crop_rec: blanking it sends to the sensor, since Canon's value is for its default timers; 0 = none */
+static int (*crop_rec_get_sensor_shutter_blanking)() = MODULE_FUNCTION(crop_rec_get_sensor_shutter_blanking);
+#endif
+
 int get_current_shutter_reciprocal_x1000()
 {
 #ifdef FRAME_SHUTTER_BLANKING_READ
@@ -467,6 +497,13 @@ int get_current_shutter_reciprocal_x1000()
     #else
     int blanking = nrzi_decode(FRAME_SHUTTER_BLANKING_READ);
     #endif
+
+    /* crop_rec modes (other sensor timers): what the sensor really gets */
+    int crop_rec_blanking = crop_rec_get_sensor_shutter_blanking();
+    if (crop_rec_blanking > 0)
+    {
+        blanking = crop_rec_blanking;
+    }
 
     /* read the FPS timer B directly from ENGIO shadow memory to have the latest value */
     int timerB = (FPS_REGISTER_B_VALUE & 0xFFFF) + 1;

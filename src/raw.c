@@ -1319,6 +1319,55 @@ void raw_set_preview_rect(int x, int y, int w, int h, int obey_info_bars)
     lv2raw.ty = y - LV2RAW_DY(y0_lv);
 }
 
+#define RAW_OVERLAY_GEOM_DEFAULT    0
+#define RAW_OVERLAY_GEOM_PREVIEW    1
+#define RAW_OVERLAY_GEOM_FILL_WIDTH 2
+
+static volatile int overlay_geom = RAW_OVERLAY_GEOM_DEFAULT;
+static volatile int overlay_geom_expiry = 0;
+static volatile int overlay_geom_x, overlay_geom_y, overlay_geom_w, overlay_geom_h, overlay_geom_rx, overlay_geom_ry;
+
+void raw_overlay_geometry_preview(int x, int y, int w, int h, int rx, int ry)
+{
+    overlay_geom_x = x;
+    overlay_geom_y = y;
+    overlay_geom_w = w;
+    overlay_geom_h = h;
+    overlay_geom_rx = rx;
+    overlay_geom_ry = ry;
+    overlay_geom = RAW_OVERLAY_GEOM_PREVIEW;
+    overlay_geom_expiry = get_ms_clock() + 1000;
+}
+
+void raw_overlay_geometry_fill_width()
+{
+    overlay_geom = RAW_OVERLAY_GEOM_FILL_WIDTH;
+    overlay_geom_expiry = get_ms_clock() + 1000;
+}
+
+/* called after setting the default geometry */
+static void raw_apply_overlay_geometry()
+{
+    if (overlay_geom == RAW_OVERLAY_GEOM_DEFAULT || get_ms_clock() > overlay_geom_expiry)
+    {
+        return;
+    }
+
+    if (overlay_geom == RAW_OVERLAY_GEOM_PREVIEW)
+    {
+        raw_set_preview_rect(overlay_geom_x, overlay_geom_y, overlay_geom_w, overlay_geom_h, 1);
+        raw_force_aspect_ratio(overlay_geom_rx, overlay_geom_ry);
+    }
+    else if (overlay_geom == RAW_OVERLAY_GEOM_FILL_WIDTH)
+    {
+        /* as many raw lines per screen line as raw columns per screen column, centered */
+        lv2raw.sy = lv2raw.sx;
+        int raw_yc = preview_rect_y + preview_rect_h / 2;
+        int lv_yc  = BM2LV_Y(os.y0 + os.y_ex / 2);
+        lv2raw.ty = raw_yc - LV2RAW_DY(lv_yc);
+    }
+}
+
 /* fixme: external calls to this are not exactly thread safe
  * and they can be overwritten any time by raw_update_params */
 void REQUIRES(raw_sem)
@@ -1391,6 +1440,9 @@ raw_set_geometry(int width, int height, int skip_left, int skip_right, int skip_
 #endif
 
     raw_set_preview_rect(preview_skip_left, preview_skip_top, preview_width, preview_height, 0);
+
+    /* what's really on screen, if a raw video module said so */
+    raw_apply_overlay_geometry();
 
     dbg_printf("lv2raw sx:%d sy:%d tx:%d ty:%d\n", lv2raw.sx, lv2raw.sy, lv2raw.tx, lv2raw.ty);
     dbg_printf("raw2lv test: (%d,%d) - (%d,%d)\n", RAW2LV_X(raw_info.active_area.x1), RAW2LV_Y(raw_info.active_area.y1), RAW2LV_X(raw_info.active_area.x2), RAW2LV_Y(raw_info.active_area.y2));

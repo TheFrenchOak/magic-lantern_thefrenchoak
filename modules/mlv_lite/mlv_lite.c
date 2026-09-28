@@ -141,6 +141,9 @@ static const int canon_desqueeze_x100[] = { 0, 0, 125, 133, 140, 150, 160, 164, 
                                 "x2.00", "x2.20", "x2.40", "x2.50", "x2.75", "x3.00", "x3.25", "x3.50"
 static int canon_view_squeeze_auto_x1000();
 
+/* is our framing preview on screen? (otherwise, Canon's LiveView is) */
+static volatile int ml_preview_shown = 0;
+
 /* set when recording stops without being asked to, so the user is told why */
 static volatile int unexpected_stop = 0;
 #define UNEXPECTED_STOP_LV_SETTINGS 1   /* raw resolution changed under our feet */
@@ -2145,6 +2148,12 @@ static void update_canon_view_desqueeze()
 
     /* only used while Canon's LiveView is on screen (our framing preview replaces it otherwise) */
     anamorphic_preview_force(squeeze);
+
+    /* Canon's LiveView of 1x3 modes: tell raw overlays it only shows the central lines */
+    if (squeeze && !ml_preview_shown)
+    {
+        raw_overlay_geometry_fill_width();
+    }
 }
 
 static REQUIRES(ShootTask) EXCLUDES(settings_sem)
@@ -4835,6 +4844,7 @@ unsigned int raw_rec_update_preview(unsigned int ctx)
     if (ctx == 0)
     {
         int enabled = raw_rec_should_preview();
+        ml_preview_shown = enabled;
         if (!enabled && preview_dirty)
         {
             /* cleanup the mess, if any */
@@ -4865,16 +4875,16 @@ unsigned int raw_rec_update_preview(unsigned int ctx)
     /* sensor binning (e.g. 1x3), times the anamorphic lens squeeze from Display > Anamorphic
      * (the Canon-side anamorphic filter does not apply to our preview) */
     int squeeze = get_anamorphic_preview_squeeze_x1000();
+    int rx = 0, ry = 0;     /* 0: from binning */
     if (squeeze > 1000)
     {
-        int rx = raw_capture_info.binning_x + raw_capture_info.skipping_x;
-        int ry = raw_capture_info.binning_y + raw_capture_info.skipping_y;
-        raw_force_aspect_ratio(rx * squeeze, ry * 1000);
+        rx = (raw_capture_info.binning_x + raw_capture_info.skipping_x) * squeeze;
+        ry = (raw_capture_info.binning_y + raw_capture_info.skipping_y) * 1000;
     }
-    else
-    {
-        raw_force_aspect_ratio(0, 0);
-    }
+    raw_force_aspect_ratio(rx, ry);
+
+    /* raw overlays (false color, zebras) must use the same geometry as this preview */
+    raw_overlay_geometry_preview(skip_x, skip_y, res_x, res_y, rx, ry);
 
     /* when recording, preview both full-size buffers,
      * to make sure it's not recording every other frame */
@@ -5173,6 +5183,10 @@ static void cine_preset_apply(int id)
     {
         menu_set_value_from_script("Expo", "Dual ISO", 0);
     }
+
+    /* exact 180 degree shutter (1/48 at 23.976); changing it afterwards is a creative choice,
+     * so it is not checked by cine_preset_update_state */
+    menu_set_value_from_script("Movie", "Shutter angle", 1);
 
     if (span)
     {

@@ -709,13 +709,37 @@ static MENU_UPDATE_FUNC(vignetting_graphs_update)
 
 static CONFIG_INT("shutter.finetune", shutter_finetune, 0);
 
+/* exact shutter angle in movie mode (e.g. 180 degrees = 1/48 at 24p, which Canon doesn't offer);
+ * overrides Canon's shutter speed and the fine-tuning above */
+static CONFIG_INT("shutter.angle", shutter_angle_mode, 0);
+static const int shutter_angles[] = { 0, 180, 90, 270 };
+#define SHUTTER_ANGLE_CHOICES "OFF", "180"SYM_DEGREE, "90"SYM_DEGREE, "270"SYM_DEGREE
+
 static volatile int orig_shutter_timer = 0;
 static volatile int adjusted_shutter_timer = 0;
+
+static int shutter_angle_timer()
+{
+    int mode = COERCE(shutter_angle_mode, 0, COUNT(shutter_angles) - 1);
+    return mode ? get_shutter_timer_for_angle(shutter_angles[mode]) : 0;
+}
 
 /* should be called from the LV state object, from the same spot as HDR video */
 void shutter_finetune_step()
 {
-    if (is_movie_mode() && shutter_finetune)
+    if (!is_movie_mode())
+    {
+        return;
+    }
+
+    int angle_timer = shutter_angle_timer();
+    if (angle_timer)
+    {
+        orig_shutter_timer = FRAME_SHUTTER_TIMER;
+        adjusted_shutter_timer = COERCE(angle_timer, MIN_SHUTTER_TIMER, 65535);
+        FRAME_SHUTTER_TIMER = adjusted_shutter_timer;
+    }
+    else if (shutter_finetune)
     {
         orig_shutter_timer = FRAME_SHUTTER_TIMER;
         adjusted_shutter_timer = COERCE(orig_shutter_timer + shutter_finetune, MIN_SHUTTER_TIMER, 65535);
@@ -725,8 +749,30 @@ void shutter_finetune_step()
 
 int shutter_finetune_get_adjusted_timer()
 {
-    if (shutter_finetune) return adjusted_shutter_timer;
+    if (shutter_finetune || shutter_angle_mode) return adjusted_shutter_timer;
     else return FRAME_SHUTTER_TIMER;
+}
+
+static MENU_UPDATE_FUNC(shutter_angle_display)
+{
+    if (!shutter_angle_mode || !is_movie_mode())
+    {
+        return;
+    }
+
+    /* what the sensor really does (reads the shutter blanking back) */
+    int s = get_current_shutter_reciprocal_x1000();
+    int fps = fps_get_current_x1000();
+    if (s > 0 && fps > 0)
+    {
+        int deg_x10 = 3600 * fps / s;   /* degrees x10 */
+        MENU_SET_RINFO("1/%d.%d, %d.%d"SYM_DEGREE, s / 1000, (s % 1000) / 100, deg_x10 / 10, deg_x10 % 10);
+    }
+
+    if (shutter_finetune)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "Shutter fine-tuning is ignored while a shutter angle is selected.");
+    }
 }
 
 static MENU_UPDATE_FUNC(shutter_finetune_display)
@@ -937,6 +983,22 @@ static struct menu_entry lv_img_menu[] = {
             },
             MENU_EOL,
         },
+    },
+    #endif
+
+    #ifdef FEATURE_SHUTTER_FINE_TUNING
+    {
+        .name = "Shutter angle",
+        .priv = &shutter_angle_mode,
+        .max = COUNT(shutter_angles) - 1,
+        .choices = CHOICES(SHUTTER_ANGLE_CHOICES),
+        .update = shutter_angle_display,
+        .help = "Exact shutter angle, whatever the frame rate (180: 1/48 at 24p, 1/50 at 25p).",
+        .help2 = "OFF: Canon's shutter speed.\n"
+                 "Motion blur of film cameras.\n"
+                 "Sharper motion (action, slow motion).\n"
+                 "More motion blur, more light.\n",
+        .depends_on = DEP_LIVEVIEW | DEP_MOVIE_MODE,
     },
     #endif
 

@@ -1066,6 +1066,11 @@ static int FAST adtg_lookup(uint32_t* data_buf, int reg_needle)
     return -1;
 }
 
+/* shutter blanking actually sent to the sensor by adjust_shutter_blanking (0 = none);
+ * Canon's own value is meant for its default timers, so ML core would show a wrong shutter
+ * speed / angle in our modes (see crop_rec_get_sensor_shutter_blanking) */
+static volatile int sensor_shutter_blanking = 0;
+
 /* adapted from fps_override_shutter_blanking in fps-engio.c */
 static int adjust_shutter_blanking(int old)
 {
@@ -1082,6 +1087,7 @@ static int adjust_shutter_blanking(int old)
     /* wrong assumptions? */
     if (current_exposure < 0)
     {
+        sensor_shutter_blanking = 0;
         return old;
     }
     
@@ -1126,6 +1132,7 @@ static int adjust_shutter_blanking(int old)
     
     dbg_printf("Blanking %d->%d\n", current_blanking, new_blanking);
     
+    sensor_shutter_blanking = new_blanking;
     return nrzi_encode(new_blanking);
 }
 
@@ -1205,6 +1212,10 @@ static void FAST adtg_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
                 ((crop_preset != CROP_PRESET_CENTER_Z && crop_preset != CROP_PRESET_33K) && lv_dispsize == 1))
             {
                 shutter_blanking = adjust_shutter_blanking(shutter_blanking);
+            }
+            else
+            {
+                sensor_shutter_blanking = 0;
             }
         }
     }
@@ -2231,6 +2242,28 @@ static void FAST engio_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 }
 
 static int patch_active = 0;
+
+/* for ML core (fps-engio.c): Canon's default timer A for the current video mode; ML core can't
+ * read it from the registers, since we override the "default" one too (0 = crop_rec not active).
+ * Canon's shutter timer (FRAME_SHUTTER_TIMER) counts line periods of this timer A. */
+int crop_rec_get_canon_timer_a()
+{
+    if (!patch_active || !is_supported_mode())
+    {
+        return 0;
+    }
+    return default_timerA[get_video_mode_index()];
+}
+
+/* for ML core (fps-engio.c): shutter blanking sent to the sensor in our modes, 0 = Canon's value is right */
+int crop_rec_get_sensor_shutter_blanking()
+{
+    if (!patch_active || !is_supported_mode())
+    {
+        return 0;
+    }
+    return sensor_shutter_blanking;
+}
 
 static void update_patch()
 {

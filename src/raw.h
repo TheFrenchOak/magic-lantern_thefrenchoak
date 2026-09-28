@@ -148,6 +148,12 @@ void raw_set_geometry(int width, int height, int skip_left, int skip_right, int 
 void raw_force_aspect_ratio(int factor_x, int factor_y);
 void raw_set_preview_rect(int x, int y, int w, int h, int obey_info_bars);
 
+/* Raw overlays (RAW zebras, RAW false color...) map the screen to the raw image with lv2raw, which
+ * raw_set_geometry resets to Canon's default LiveView (whole active area on the whole screen).
+ * A module showing something else tells it here; each call is valid for one second. */
+void raw_overlay_geometry_preview(int x, int y, int w, int h, int rx, int ry);  /* raw video framing preview: this raw area, proportions kept (see raw_force_aspect_ratio) */
+void raw_overlay_geometry_fill_width();     /* Canon's LiveView in 1x3 modes: whole width, central lines, same scale as the columns */
+
 /* call this after you have altered the preview settings, and you want to restore the original ones */
 void raw_set_dirty(void);
 

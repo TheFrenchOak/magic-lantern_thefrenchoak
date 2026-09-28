@@ -10,7 +10,13 @@ Le nom du preset actif s'affiche dans la barre du haut (`*` = un réglage a ét�
 | **S35 HQ** | 3.5K 1:1, zoom x5 (~1.6×) | 3584×1730 | 10 | CF + SD | Détail maximal |
 | **FF SAFE** | 1080p 3x3 plein format | 1920×1280 (3:2) | 14 | CF | Fiable, léger : mouvement, prises importantes |
 
-Tous : 23,976 i/s, RAW lossless, son 48 kHz, Dual ISO OFF, pré-record / rec trigger / proxy H.264 OFF.
+Tous : 23,976 i/s, **obturateur à 180° exact** (1/48), RAW lossless, son 48 kHz, Dual ISO OFF,
+pré-record / rec trigger / proxy H.264 OFF.
+
+**Obturateur :** Movie → **Shutter angle** : OFF (vitesse Canon), 180°, 90° (mouvements plus nets),
+270° (plus de flou de mouvement, plus de lumière). L'angle reste exact quelle que soit la cadence ;
+la vitesse Canon est ignorée tant qu'un angle est choisi (utilise le mode M).
+La barre du bas affiche l'angle réel.
 
 ## Une seule fois
 

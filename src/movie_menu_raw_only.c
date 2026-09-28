@@ -65,6 +65,10 @@ static struct menu_entry movie_menu_raw_toggle[] =
         .placeholder = 1,
     },
     {
+        .name = "Shutter angle",
+        .placeholder = 1,
+    },
+    {
         .name = "Shutter fine-tuning",
         .placeholder = 1,
     },

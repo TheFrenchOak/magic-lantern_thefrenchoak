@@ -17,6 +17,9 @@ int fps_get_shutter_speed_shift(int raw_shutter);
 /* slowest shutter speed */
 int get_max_shutter_timer();
 
+/* shutter timer (FRAME_SHUTTER_TIMER units) for a shutter angle (degrees) at the current frame rate; 0 if unknown */
+int get_shutter_timer_for_angle(int angle);
+
 /* from DebugMsg hack */
 void fps_override_shutter_blanking();
 
